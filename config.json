@@ -32,7 +32,7 @@
     "retryTimes": 3,
     "skipProjectIdFetch": false,
     "useNativeAxios": false,
-    "useContextSystemPrompt": false,
+    "useContextSystemPrompt": true,
     "passSignatureToClient": false
   }
 }

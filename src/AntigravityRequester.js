@@ -259,36 +259,34 @@ class antigravityRequester {
             // 清理缓冲区
             this.buffer = '';
             
+            const proc = this.proc;
+            this.proc = null;
+            
             // 关闭输入流
             try {
-                this.proc.stdin.end();
+                proc.stdin.end();
             } catch (e) {
                 // 忽略关闭错误
             }
             
-            // 给子进程一点时间优雅退出，否则强制终止
-            const proc = this.proc;
-            this.proc = null;
-            
-            setTimeout(() => {
-                try {
-                    if (proc && !proc.killed) {
-                        proc.kill('SIGTERM');
-                        // 如果 SIGTERM 无效，1秒后使用 SIGKILL
-                        setTimeout(() => {
-                            try {
-                                if (proc && !proc.killed) {
-                                    proc.kill('SIGKILL');
-                                }
-                            } catch (e) {
-                                // 忽略错误
-                            }
-                        }, 1000);
-                    }
-                } catch (e) {
-                    // 忽略错误
+            // 立即发送 SIGTERM 终止子进程，不使用 setTimeout
+            // 这样可以确保在主进程退出前子进程被正确终止
+            try {
+                if (proc && !proc.killed) {
+                    proc.kill('SIGTERM');
                 }
-            }, 500);
+            } catch (e) {
+                // 忽略错误
+            }
+            
+            // 如果 SIGTERM 无效，立即使用 SIGKILL
+            try {
+                if (proc && !proc.killed) {
+                    proc.kill('SIGKILL');
+                }
+            } catch (e) {
+                // 忽略错误
+            }
         }
     }
 }

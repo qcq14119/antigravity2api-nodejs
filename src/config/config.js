@@ -36,8 +36,8 @@ function getAdminCredentials() {
   // 生成随机凭据（只生成一次）
   if (!generatedCredentials) {
     generatedCredentials = {
-      username: username || `admin_${crypto.randomBytes(4).toString('hex')}`,
-      password: password || crypto.randomBytes(12).toString('base64').replace(/[+/=]/g, ''),
+      username: username || crypto.randomBytes(8).toString('hex'),
+      password: password || crypto.randomBytes(16).toString('base64').replace(/[+/=]/g, ''),
       jwtSecret: jwtSecret || crypto.randomBytes(32).toString('hex')
     };
     
@@ -61,14 +61,27 @@ function getAdminCredentials() {
   return generatedCredentials;
 }
 
-const { envPath, configJsonPath, examplePath } = getConfigPaths();
+const { envPath, configJsonPath } = getConfigPaths();
 
-// 确保 .env 存在（如果缺失则从 .env.example 复制一份）
+// 默认系统提示词
+const DEFAULT_SYSTEM_INSTRUCTION = '你是聊天机器人，名字叫萌萌，如同名字这般，你的性格是软软糯糯萌萌哒的，专门为用户提供聊天和情绪价值，协助进行小说创作或者角色扮演';
+
+// 确保 .env 存在（如果缺失则创建带默认配置的文件）
 if (!fs.existsSync(envPath)) {
-  if (fs.existsSync(examplePath)) {
-    fs.copyFileSync(examplePath, envPath);
-    log.info('✓ 已从 .env.example 创建 .env 文件');
-  }
+  const defaultEnvContent = `# 敏感配置（只在 .env 中配置）
+# 如果不配置以下三项，系统会自动生成随机凭据并在启动时显示
+# API_KEY=your-api-key
+# ADMIN_USERNAME=your-username
+# ADMIN_PASSWORD=your-password
+# JWT_SECRET=your-jwt-secret
+
+# 可选配置
+# PROXY=http://127.0.0.1:7890
+SYSTEM_INSTRUCTION=${DEFAULT_SYSTEM_INSTRUCTION}
+# IMAGE_BASE_URL=http://your-domain.com
+`;
+  fs.writeFileSync(envPath, defaultEnvContent, 'utf8');
+  log.info('✓ 已创建 .env 文件，包含默认萌萌系统提示词');
 }
 
 // 加载 config.json

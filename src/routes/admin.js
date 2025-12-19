@@ -178,6 +178,27 @@ router.post('/tokens/reload', authMiddleware, async (req, res) => {
   }
 });
 
+// 刷新指定Token的access_token
+router.post('/tokens/:refreshToken/refresh', authMiddleware, async (req, res) => {
+  const { refreshToken } = req.params;
+  try {
+    logger.info('正在刷新token...');
+    const tokens = await tokenManager.getTokenList();
+    const tokenData = tokens.find(t => t.refresh_token === refreshToken);
+    
+    if (!tokenData) {
+      return res.status(404).json({ success: false, message: 'Token不存在' });
+    }
+    
+    // 调用 tokenManager 的刷新方法
+    const refreshedToken = await tokenManager.refreshToken(tokenData);
+    res.json({ success: true, message: 'Token刷新成功', data: { expires_in: refreshedToken.expires_in, timestamp: refreshedToken.timestamp } });
+  } catch (error) {
+    logger.error('刷新Token失败:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 router.post('/oauth/exchange', authMiddleware, async (req, res) => {
   const { code, port } = req.body;
   if (!code || !port) {

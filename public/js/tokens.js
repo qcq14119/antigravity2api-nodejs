@@ -104,6 +104,7 @@ function renderTokens(tokens) {
             </div>
             <div class="token-actions">
                 <button class="btn btn-info btn-xs" onclick="showQuotaModal('${safeRefreshToken}')" title="查看额度">📊 详情</button>
+                <button class="btn btn-primary btn-xs" onclick="manualRefreshToken('${safeRefreshToken}')" title="刷新Token" ${isRefreshing ? 'disabled' : ''}>🔄 刷新</button>
                 <button class="btn ${token.enable ? 'btn-warning' : 'btn-success'} btn-xs" onclick="toggleToken('${safeRefreshToken}', ${!token.enable})" title="${token.enable ? '禁用' : '启用'}">
                     ${token.enable ? '⏸️ 禁用' : '▶️ 启用'}
                 </button>
@@ -124,6 +125,15 @@ function renderTokens(tokens) {
             autoRefreshToken(refreshToken);
         });
     }
+}
+
+// 手动刷新 Token
+async function manualRefreshToken(refreshToken) {
+    if (refreshingTokens.has(refreshToken)) {
+        showToast('该 Token 正在刷新中', 'warning');
+        return;
+    }
+    await autoRefreshToken(refreshToken);
 }
 
 // 自动刷新过期 Token
