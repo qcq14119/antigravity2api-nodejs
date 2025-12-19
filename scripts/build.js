@@ -97,6 +97,7 @@ const pkgJson = {
   bin: 'server.cjs',
   pkg: {
     assets: [
+      toSlash(path.join(rootDir, 'public', '**/*')),
       toSlash(path.join(rootDir, 'public', '*.html')),
       toSlash(path.join(rootDir, 'public', '*.css')),
       toSlash(path.join(rootDir, 'public', 'js', '*.js')),
