@@ -4,13 +4,13 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Token 管理</title>
-    <!-- 防止页面闪烁：在渲染前根据登录状态和Tab状态设置初始显示 -->
+    <!-- 防止页面闪烁：在渲染前根据Tab状态设置初始显示 -->
     <script>
         (function() {
-            var isLoggedIn = localStorage.getItem('authToken');
+            // 初始状态：auth-checking 表示正在验证登录状态
+            // 验证完成后会变成 auth-ready + logged-in 或 auth-ready
             var currentTab = localStorage.getItem('currentTab') || 'tokens';
-            var classes = ['auth-ready'];
-            if (isLoggedIn) classes.push('logged-in');
+            var classes = ['auth-checking'];
             if (currentTab === 'settings') classes.push('tab-settings');
             document.documentElement.className = classes.join(' ');
             // 检测字体加载
@@ -27,24 +27,52 @@
         })();
     </script>
     <style>
-/* 防止闪烁的关键样式 - 来自 binary-build */
-html:not(.auth-ready) #loginForm,
-html:not(.auth-ready) #mainContent { visibility: hidden; }
-/* 登录状态显示控制 - 合并两个分支 */
+/* 验证中状态：隐藏登录框和主内容，显示加载指示器 */
+html.auth-checking #loginForm,
+html.auth-checking #mainContent { display: none !important; }
+html.auth-checking #authLoading { display: flex !important; }
+/* 验证完成后：隐藏加载指示器 */
+html.auth-ready #authLoading { display: none !important; }
+/* 登录状态显示控制 */
 .logged-in #loginForm { display: none !important; }
 .logged-in #mainContent { display: flex !important; }
-html:not(.logged-in) #mainContent { display: none !important; }
-/* Tab状态管理 - 来自 binary-build */
+html.auth-ready:not(.logged-in) #loginForm { display: block !important; }
+html.auth-ready:not(.logged-in) #mainContent { display: none !important; }
+/* Tab状态管理 */
 html.tab-settings #tokensPage { display: none !important; }
 html.tab-settings #settingsPage { display: block !important; }
-html.tab-settings .tab[data-tab="tokens"] { 
+html.tab-settings .tab[data-tab="tokens"] {
     background: transparent !important;
-    color: var(--text-light, #888) !important; 
+    color: var(--text-light, #888) !important;
 }
-html.tab-settings .tab[data-tab="settings"] { 
-    background: var(--primary, #4f46e5) !important; 
-    color: white !important; 
+html.tab-settings .tab[data-tab="settings"] {
+    background: var(--primary, #4f46e5) !important;
+    color: white !important;
 }
+/* 加载指示器样式 */
+#authLoading {
+    display: none;
+    position: fixed;
+    inset: 0;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 1rem;
+    background: var(--bg, #f8fafc);
+}
+#authLoading .spinner {
+    width: 40px;
+    height: 40px;
+    border: 3px solid var(--border, #e2e8f0);
+    border-top-color: var(--primary, #0891b2);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+}
+#authLoading .loading-text {
+    color: var(--text-light, #64748b);
+    font-size: 0.875rem;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
     </style>
     <!-- 主样式表 - 优先加载 -->
     <link rel="stylesheet" href="style.css">
@@ -61,6 +89,12 @@ html.tab-settings .tab[data-tab="settings"] {
     </noscript>
 </head>
 <body>
+    <!-- 验证登录状态时的加载指示器 -->
+    <div id="authLoading">
+        <div class="spinner"></div>
+        <div class="loading-text">正在验证登录状态...</div>
+    </div>
+
     <div class="container">
         <!-- 登录表单 -->
         <div id="loginForm" class="login-form">
@@ -92,7 +126,7 @@ html.tab-settings .tab[data-tab="settings"] {
             <div class="content">
                 <!-- Token管理页面 -->
                 <div id="tokensPage">
-                    <!-- 统计卡片 + 操作按钮 合并 -->
+                    <!-- 统计卡片 + 操作按钮 -->
                     <div class="top-bar">
                         <div class="stats-inline">
                             <div class="stat-item clickable active" onclick="filterTokens('all')">
@@ -107,12 +141,15 @@ html.tab-settings .tab[data-tab="settings"] {
                                 <span class="stat-num" id="disabledTokens">0</span>
                                 <span class="stat-text">禁用</span>
                             </div>
+                            <button type="button" class="action-toggle-btn" id="actionToggleBtn" onclick="toggleActionBar()" title="收起操作按钮">▾</button>
                         </div>
-                        <div class="action-btns">
+                        <div class="action-btns" id="actionBar">
                             <button type="button" onclick="showOAuthModal()" class="btn btn-success btn-sm">🔐 OAuth</button>
                             <button type="button" onclick="showManualModal()" class="btn btn-secondary btn-sm">✏️ 手动</button>
-                            <button type="button" onclick="loadTokens()" class="btn btn-warning btn-sm">🔄 刷新</button>
-                            <button type="button" onclick="toggleSensitiveInfo()" class="btn btn-sm" id="toggleSensitiveBtn" title="隐藏/显示敏感信息">👁️ 显示</button>
+                            <button type="button" onclick="refreshAllQuotas()" class="btn btn-info btn-sm" id="refreshQuotasBtn">📊 刷新额度</button>
+                            <button type="button" onclick="loadTokens()" class="btn btn-warning btn-sm">🔄 重载</button>
+                            <button type="button" onclick="exportTokens()" class="btn btn-sm" style="background: var(--primary);" title="导出Token">📤 导出</button>
+                            <button type="button" onclick="importTokens()" class="btn btn-sm" style="background: var(--primary);" title="导入Token">📥 导入</button>
                         </div>
                     </div>
 
@@ -250,23 +287,39 @@ html.tab-settings .tab[data-tab="settings"] {
                                         </label>
                                     </div>
                                     <div class="form-group compact switch-group">
-                                        <label>缓存签名 <span class="help-tip" data-tooltip="将上游返回的签名缓存并自动补全到后续请求">?</span></label>
-                                        <label class="switch">
-                                            <input type="checkbox" name="USE_CACHED_SIGNATURE" checked>
-                                            <span class="slider"></span>
-                                        </label>
-                                    </div>
-                                    <div class="form-group compact switch-group">
                                         <label>兜底签名 <span class="help-tip" data-tooltip="没有缓存签名时，使用内置默认签名自动补全">?</span></label>
                                         <label class="switch">
                                             <input type="checkbox" name="USE_FALLBACK_SIGNATURE" checked>
                                             <span class="slider"></span>
                                         </label>
                                     </div>
+                                </div>
+                                <div class="form-row-inline switch-row">
                                     <div class="form-group compact switch-group">
-                                        <label>仅工具签名缓存 <span class="help-tip" data-tooltip="仅在有工具调用时缓存和补全工具签名">?</span></label>
+                                        <label>缓存所有签名 <span class="help-tip" data-tooltip="开启后缓存所有签名">?</span></label>
                                         <label class="switch">
-                                            <input type="checkbox" name="CACHE_ONLY_TOOL_SIGNATURES">
+                                            <input type="checkbox" name="CACHE_ALL_SIGNATURES">
+                                            <span class="slider"></span>
+                                        </label>
+                                    </div>
+                                    <div class="form-group compact switch-group">
+                                        <label>工具签名 <span class="help-tip" data-tooltip="使用工具时缓存签名">?</span></label>
+                                        <label class="switch">
+                                            <input type="checkbox" name="CACHE_TOOL_SIGNATURES" checked>
+                                            <span class="slider"></span>
+                                        </label>
+                                    </div>
+                                    <div class="form-group compact switch-group">
+                                        <label>图像签名 <span class="help-tip" data-tooltip="使用图像模型时缓存签名">?</span></label>
+                                        <label class="switch">
+                                            <input type="checkbox" name="CACHE_IMAGE_SIGNATURES" checked>
+                                            <span class="slider"></span>
+                                        </label>
+                                    </div>
+                                    <div class="form-group compact switch-group">
+                                        <label>缓存思考 <span class="help-tip" data-tooltip="缓存思考内容，随签名一起返回">?</span></label>
+                                        <label class="switch">
+                                            <input type="checkbox" name="CACHE_THINKING" checked>
                                             <span class="slider"></span>
                                         </label>
                                     </div>

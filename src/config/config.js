@@ -167,10 +167,13 @@ export function buildConfig(jsonConfig) {
     useContextSystemPrompt: jsonConfig.other?.useContextSystemPrompt === true,
     passSignatureToClient: jsonConfig.other?.passSignatureToClient === true,
     useFallbackSignature: jsonConfig.other?.useFallbackSignature !== false,
-    useCachedSignature: jsonConfig.other?.useCachedSignature !== false,
-    cacheOnlyToolSignatures: jsonConfig.other?.cacheOnlyToolSignatures === true ||
-      process.env.CACHE_ONLY_TOOL_SIGNATURES === '1' ||
-      process.env.CACHE_ONLY_TOOL_SIGNATURES === 'true',
+    // 签名缓存配置（新版）
+    cacheAllSignatures: jsonConfig.other?.cacheAllSignatures === true ||
+      process.env.CACHE_ALL_SIGNATURES === '1' ||
+      process.env.CACHE_ALL_SIGNATURES === 'true',
+    cacheToolSignatures: jsonConfig.other?.cacheToolSignatures !== false,
+    cacheImageSignatures: jsonConfig.other?.cacheImageSignatures !== false,
+    cacheThinking: jsonConfig.other?.cacheThinking !== false,
     // 调试：完整打印最终请求体与原始响应（可能包含敏感内容/大体积数据）
     debugDumpRequestResponse:
       jsonConfig.other?.debugDumpRequestResponse === true ||

@@ -1,6 +1,6 @@
 import memoryManager, { registerMemoryPoolCleanup } from '../utils/memoryManager.js';
 import { generateToolCallId } from '../utils/idGenerator.js';
-import { setReasoningSignature, setToolSignature } from '../utils/thoughtSignatureCache.js';
+import { setSignature, shouldCacheSignature, isImageModel } from '../utils/thoughtSignatureCache.js';
 import { getOriginalToolName } from '../utils/toolNameCache.js';
 import config from '../config/config.js';
 
@@ -89,6 +89,7 @@ function convertToToolCall(functionCall, sessionId, model) {
 // 解析并发送流式响应片段（会修改 state 并触发 callback）
 // 支持 DeepSeek 格式：思维链内容通过 reasoning_content 字段输出
 // 同时透传 thoughtSignature，方便客户端后续复用
+// 签名和思考内容绑定存储：收集完整思考内容后和签名一起缓存
 function parseAndEmitStreamChunk(line, state, callback) {
   if (!line.startsWith(DATA_PREFIX)) return;
   
@@ -100,24 +101,22 @@ function parseAndEmitStreamChunk(line, state, callback) {
       for (const part of parts) {
         if (part.thoughtSignature) {
           // Gemini 等模型可能只在 functionCall part 上给出 thoughtSignature；
-          // 将其视为本轮“最新签名”，用于后续 functionCall 兜底与下次请求缓存。
+          // 将其视为本轮"最新签名"，用于后续 functionCall 兜底与下次请求缓存。
           if (part.thoughtSignature !== state.reasoningSignature) {
             state.reasoningSignature = part.thoughtSignature;
-            if (state.sessionId && state.model && config.useCachedSignature) {
-              setReasoningSignature(state.sessionId, state.model, part.thoughtSignature);
-            }
+            // 延迟缓存：等收集完思考内容后再缓存
           }
         }
 
         if (part.thought === true) {
+          // 累积思考内容
+          if (part.text) {
+            state.reasoningContent = (state.reasoningContent || '') + part.text;
+          }
+          
           if (part.thoughtSignature) {
             state.reasoningSignature = part.thoughtSignature;
-            if (state.sessionId && state.model) {
-              //console.log("服务器传入的签名："+state.reasoningSignature);
-              if (config.useCachedSignature) {
-                setReasoningSignature(state.sessionId, state.model, part.thoughtSignature);
-              }
-            }
+            // 延迟到流结束时缓存，确保收集到完整的思考内容
           }
           callback({
             type: 'reasoning',
@@ -131,11 +130,8 @@ function parseAndEmitStreamChunk(line, state, callback) {
           const sig = part.thoughtSignature || state.reasoningSignature || null;
           if (sig) {
             toolCall.thoughtSignature = sig;
-            if (state.sessionId && state.model) {
-              if (config.useCachedSignature) {
-                setToolSignature(state.sessionId, state.model, sig);
-              }
-            }
+            // 标记有工具调用
+            state.hasToolCalls = true;
           }
           state.toolCalls.push(toolCall);
         }
@@ -143,6 +139,17 @@ function parseAndEmitStreamChunk(line, state, callback) {
     }
     
     if (data.response?.candidates?.[0]?.finishReason) {
+      // 流结束时，判断是否应该缓存签名
+      const hasTools = state.hasToolCalls || state.toolCalls.length > 0;
+      const isImage = isImageModel(state.model);
+      
+      if (state.sessionId && state.model && state.reasoningSignature) {
+        if (shouldCacheSignature({ hasTools, isImageModel: isImage })) {
+          const content = state.reasoningContent || ' ';
+          setSignature(state.sessionId, state.model, state.reasoningSignature, content, { hasTools, isImageModel: isImage });
+        }
+      }
+      
       if (state.toolCalls.length > 0) {
         callback({ type: 'tool_calls', tool_calls: state.toolCalls });
         state.toolCalls = [];
@@ -158,6 +165,9 @@ function parseAndEmitStreamChunk(line, state, callback) {
           }
         });
       }
+      // 清空累积的思考内容和状态
+      state.reasoningContent = '';
+      state.hasToolCalls = false;
     }
   } catch {
     // 忽略 JSON 解析错误

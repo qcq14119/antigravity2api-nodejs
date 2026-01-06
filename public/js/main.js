@@ -5,16 +5,33 @@ initFontSize();
 initSensitiveInfo();
 initFilterState(); // 恢复筛选状态
 
-// 如果已登录，显示主内容
-if (authToken) {
-    showMainContent();
-    restoreTabState(); // 恢复Tab状态
-    loadTokens();
-    // 只有在设置页面时才加载配置
-    if (localStorage.getItem('currentTab') === 'settings') {
-        loadConfig();
+// 检查登录状态并初始化
+(async function initApp() {
+    try {
+        // 检查是否已登录（通过 Cookie）
+        const loggedIn = await checkLoginStatus();
+        
+        // 验证完成，切换到 auth-ready 状态
+        document.documentElement.classList.remove('auth-checking');
+        document.documentElement.classList.add('auth-ready');
+        
+        if (loggedIn) {
+            showMainContent();
+            // 恢复Tab状态，switchTab 内部会根据 tab 类型加载对应数据
+            const savedTab = localStorage.getItem('currentTab');
+            if (savedTab === 'settings') {
+                switchTab('settings', false);
+            } else {
+                // 默认显示 tokens 页面
+                switchTab('tokens', false);
+            }
+        }
+    } catch (e) {
+        // 验证失败也要切换状态，显示登录框
+        document.documentElement.classList.remove('auth-checking');
+        document.documentElement.classList.add('auth-ready');
     }
-}
+})();
 
 // 登录表单提交
 document.getElementById('login').addEventListener('submit', async (e) => {
@@ -34,13 +51,13 @@ document.getElementById('login').addEventListener('submit', async (e) => {
         const response = await fetch('/admin/login', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
             body: JSON.stringify({ username, password })
         });
         
         const data = await response.json();
         if (data.success) {
-            authToken = data.token;
-            localStorage.setItem('authToken', authToken);
+            // 不再存储 token 到 localStorage，使用 HttpOnly Cookie
             showToast('登录成功', 'success');
             showMainContent();
             loadTokens();

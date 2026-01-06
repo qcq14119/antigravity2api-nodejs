@@ -45,9 +45,10 @@ function extractImagesFromClaudeContent(content) {
 
 function handleClaudeAssistantMessage(message, antigravityMessages, enableThinking, actualModelName, sessionId, hasTools) {
   const content = message.content;
-  const { reasoningSignature, toolSignature } = getSignatureContext(sessionId, actualModelName, hasTools);
+  const { reasoningSignature, reasoningContent, toolSignature, toolContent } = getSignatureContext(sessionId, actualModelName, hasTools);
 
   let textContent = '';
+  let thinkingContent = '';
   const toolCalls = [];
   let messageSignature = null;
 
@@ -58,7 +59,8 @@ function handleClaudeAssistantMessage(message, antigravityMessages, enableThinki
       if (item.type === 'text') {
         textContent += item.text || '';
       } else if (item.type === 'thinking') {
-        // Claude thinking block: signature may be required by upstream when includeThoughts enabled
+        // Claude thinking block: collect thinking content and signature
+        if (item.thinking) thinkingContent += item.thinking;
         if (!messageSignature && item.signature) messageSignature = item.signature;
       } else if (item.type === 'tool_use') {
         const safeName = processToolName(item.name, sessionId, actualModelName);
@@ -75,7 +77,16 @@ function handleClaudeAssistantMessage(message, antigravityMessages, enableThinki
     const signature = messageSignature || reasoningSignature || toolSignature;
     // 只有在有签名时才添加 thought part，避免 API 报错
     if (signature) {
-      parts.push(createThoughtPart(' ', signature));
+      // 优先使用消息自带的思考内容，否则使用缓存的内容（与签名绑定）
+      let reasoningText = ' ';
+      if (thinkingContent.length > 0) {
+        reasoningText = thinkingContent;
+      } else if (signature === reasoningSignature) {
+        reasoningText = reasoningContent || ' ';
+      } else if (signature === toolSignature) {
+        reasoningText = toolContent || ' ';
+      }
+      parts.push(createThoughtPart(reasoningText, signature));
     }
   }
   if (hasContent) {

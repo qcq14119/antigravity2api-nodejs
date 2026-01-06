@@ -4,6 +4,234 @@ let cachedTokens = [];
 let currentFilter = localStorage.getItem('tokenFilter') || 'all'; // 'all', 'enabled', 'disabled'
 let skipAnimation = false; // 是否跳过动画
 
+// 移动端操作区手动收起/展开
+let actionBarCollapsed = localStorage.getItem('actionBarCollapsed') === 'true';
+
+// 导出 Token（需要密码验证）
+async function exportTokens() {
+    const password = await showPasswordPrompt('请输入管理员密码以导出 Token');
+    if (!password) return;
+    
+    showLoading('正在导出...');
+    try {
+        const response = await authFetch('/admin/tokens/export', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password })
+        });
+        
+        const data = await response.json();
+        hideLoading();
+        
+        if (data.success) {
+            // 创建下载
+            const blob = new Blob([JSON.stringify(data.data, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `tokens-export-${new Date().toISOString().slice(0, 10)}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            showToast('导出成功', 'success');
+        } else {
+            showToast(data.message || '导出失败', 'error');
+        }
+    } catch (error) {
+        hideLoading();
+        showToast('导出失败: ' + error.message, 'error');
+    }
+}
+
+// 导入 Token（需要密码验证）
+async function importTokens() {
+    // 创建文件选择器
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json';
+    
+    input.onchange = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        
+        try {
+            const text = await file.text();
+            const importData = JSON.parse(text);
+            
+            // 验证数据格式
+            if (!importData.tokens || !Array.isArray(importData.tokens)) {
+                showToast('无效的导入文件格式', 'error');
+                return;
+            }
+            
+            // 显示导入选项
+            showImportModal(importData);
+        } catch (error) {
+            showToast('读取文件失败: ' + error.message, 'error');
+        }
+    };
+    
+    input.click();
+}
+
+// 显示导入选项模态框
+function showImportModal(importData) {
+    const tokenCount = importData.tokens.length;
+    const modal = document.createElement('div');
+    modal.className = 'modal form-modal';
+    modal.innerHTML = `
+        <div class="modal-content">
+            <div class="modal-title">📥 导入 Token</div>
+            <p>文件包含 <strong>${tokenCount}</strong> 个 Token</p>
+            <p style="font-size: 0.85rem; color: var(--text-light);">导出时间: ${importData.exportTime || '未知'}</p>
+            <div class="form-group">
+                <label>导入模式</label>
+                <select id="importMode">
+                    <option value="merge">合并（保留现有，添加新的）</option>
+                    <option value="replace">替换（清空现有，导入新的）</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>管理员密码</label>
+                <input type="password" id="importPassword" placeholder="请输入管理员密码">
+            </div>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" onclick="this.closest('.modal').remove()">取消</button>
+                <button class="btn btn-success" onclick="confirmImport(this)">✅ 确认导入</button>
+            </div>
+        </div>
+    `;
+    modal.dataset.importData = JSON.stringify(importData);
+    document.body.appendChild(modal);
+    modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
+}
+
+// 确认导入
+async function confirmImport(btn) {
+    const modal = btn.closest('.modal');
+    const importData = JSON.parse(modal.dataset.importData);
+    const mode = document.getElementById('importMode').value;
+    const password = document.getElementById('importPassword').value;
+    
+    if (!password) {
+        showToast('请输入密码', 'warning');
+        return;
+    }
+    
+    showLoading('正在导入...');
+    try {
+        const response = await authFetch('/admin/tokens/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password, data: importData, mode })
+        });
+        
+        const data = await response.json();
+        hideLoading();
+        
+        if (data.success) {
+            modal.remove();
+            showToast(data.message, 'success');
+            loadTokens();
+        } else {
+            showToast(data.message || '导入失败', 'error');
+        }
+    } catch (error) {
+        hideLoading();
+        showToast('导入失败: ' + error.message, 'error');
+    }
+}
+
+// 密码输入提示框
+function showPasswordPrompt(message) {
+    return new Promise((resolve) => {
+        const modal = document.createElement('div');
+        modal.className = 'modal form-modal';
+        modal.innerHTML = `
+            <div class="modal-content">
+                <div class="modal-title">🔐 密码验证</div>
+                <p>${message}</p>
+                <div class="form-group">
+                    <input type="password" id="promptPassword" placeholder="请输入密码">
+                </div>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" onclick="this.closest('.modal').remove()">取消</button>
+                    <button class="btn btn-success" id="promptConfirmBtn">确认</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(modal);
+        
+        const passwordInput = document.getElementById('promptPassword');
+        const confirmBtn = document.getElementById('promptConfirmBtn');
+        
+        confirmBtn.onclick = () => {
+            const password = passwordInput.value;
+            modal.remove();
+            resolve(password || null);
+        };
+        
+        passwordInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                confirmBtn.click();
+            }
+        });
+        
+        modal.onclick = (e) => {
+            if (e.target === modal) {
+                modal.remove();
+                resolve(null);
+            }
+        };
+        
+        passwordInput.focus();
+    });
+}
+
+// 手动切换操作区显示/隐藏（暴露到全局）
+window.toggleActionBar = function() {
+    const actionBar = document.getElementById('actionBar');
+    const toggleBtn = document.getElementById('actionToggleBtn');
+    
+    if (!actionBar || !toggleBtn) return;
+    
+    actionBarCollapsed = !actionBarCollapsed;
+    localStorage.setItem('actionBarCollapsed', actionBarCollapsed);
+    
+    if (actionBarCollapsed) {
+        actionBar.classList.add('collapsed');
+        toggleBtn.classList.add('collapsed');
+        toggleBtn.title = '展开操作按钮';
+    } else {
+        actionBar.classList.remove('collapsed');
+        toggleBtn.classList.remove('collapsed');
+        toggleBtn.title = '收起操作按钮';
+    }
+}
+
+// 初始化操作区状态（恢复保存的收起/展开状态）
+function initActionBarState() {
+    const actionBar = document.getElementById('actionBar');
+    const toggleBtn = document.getElementById('actionToggleBtn');
+    
+    if (!actionBar || !toggleBtn) return;
+    
+    // 恢复保存的状态
+    if (actionBarCollapsed) {
+        actionBar.classList.add('collapsed');
+        toggleBtn.classList.add('collapsed');
+        toggleBtn.title = '展开操作按钮';
+    }
+}
+
+// 页面加载后初始化
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initActionBarState);
+} else {
+    initActionBarState();
+}
+
 // 初始化筛选状态
 function initFilterState() {
     const savedFilter = localStorage.getItem('tokenFilter') || 'all';
@@ -36,9 +264,7 @@ function filterTokens(filter) {
 
 async function loadTokens() {
     try {
-        const response = await authFetch('/admin/tokens', {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
+        const response = await authFetch('/admin/tokens');
         
         const data = await response.json();
         if (data.success) {
@@ -51,7 +277,7 @@ async function loadTokens() {
     }
 }
 
-// 正在刷新的 Token 集合
+// 正在刷新的 Token 集合（使用 tokenId）
 const refreshingTokens = new Set();
 
 function renderTokens(tokens) {
@@ -88,16 +314,17 @@ function renderTokens(tokens) {
     }
     
     tokenList.innerHTML = filteredTokens.map((token, index) => {
-        const isRefreshing = refreshingTokens.has(token.refresh_token);
-        const cardId = token.refresh_token.substring(0, 8);
+        // 使用安全的 tokenId 替代 refresh_token
+        const tokenId = token.id;
+        const isRefreshing = refreshingTokens.has(tokenId);
+        const cardId = tokenId.substring(0, 8);
         
         // 计算在原始列表中的序号（基于添加顺序）
-        const originalIndex = cachedTokens.findIndex(t => t.refresh_token === token.refresh_token);
+        const originalIndex = cachedTokens.findIndex(t => t.id === token.id);
         const tokenNumber = originalIndex + 1;
         
         // 转义所有用户数据防止 XSS
-        const safeRefreshToken = escapeJs(token.refresh_token);
-        const safeAccessTokenSuffix = escapeHtml(token.access_token_suffix || '');
+        const safeTokenId = escapeJs(tokenId);
         const safeProjectId = escapeHtml(token.projectId || '');
         const safeEmail = escapeHtml(token.email || '');
         const safeProjectIdJs = escapeJs(token.projectId || '');
@@ -110,48 +337,44 @@ function renderTokens(tokens) {
                     <span class="status ${token.enable ? 'enabled' : 'disabled'}">
                         ${token.enable ? '✅ 启用' : '❌ 禁用'}
                     </span>
-                    <button class="btn-icon token-refresh-btn ${isRefreshing ? 'loading' : ''}" id="refresh-btn-${escapeHtml(cardId)}" onclick="manualRefreshToken('${safeRefreshToken}')" title="刷新Token" ${isRefreshing ? 'disabled' : ''}>🔄</button>
+                    <button class="btn-icon token-refresh-btn ${isRefreshing ? 'loading' : ''}" id="refresh-btn-${escapeHtml(cardId)}" onclick="manualRefreshToken('${safeTokenId}')" title="刷新Token" ${isRefreshing ? 'disabled' : ''}>🔄</button>
                 </div>
                 <div class="token-header-right">
-                    <button class="btn-icon" onclick="showTokenDetail('${safeRefreshToken}')" title="编辑全部">✏️</button>
+                    <button class="btn-icon" onclick="showTokenDetail('${safeTokenId}')" title="编辑">✏️</button>
                     <span class="token-id">#${tokenNumber}</span>
                 </div>
             </div>
             <div class="token-info">
-                <div class="info-row sensitive-row">
-                    <span class="info-label">🎫</span>
-                    <span class="info-value sensitive-info" title="${safeAccessTokenSuffix}">${safeAccessTokenSuffix}</span>
-                </div>
-                <div class="info-row editable sensitive-row" onclick="editField(event, '${safeRefreshToken}', 'projectId', '${safeProjectIdJs}')" title="点击编辑">
+                <div class="info-row editable sensitive-row" onclick="editField(event, '${safeTokenId}', 'projectId', '${safeProjectIdJs}')" title="点击编辑">
                     <span class="info-label">📦</span>
                     <span class="info-value sensitive-info">${safeProjectId || '点击设置'}</span>
                     <span class="info-edit-icon">✏️</span>
                 </div>
-                <div class="info-row editable sensitive-row" onclick="editField(event, '${safeRefreshToken}', 'email', '${safeEmailJs}')" title="点击编辑">
+                <div class="info-row editable sensitive-row" onclick="editField(event, '${safeTokenId}', 'email', '${safeEmailJs}')" title="点击编辑">
                     <span class="info-label">📧</span>
                     <span class="info-value sensitive-info">${safeEmail || '点击设置'}</span>
                     <span class="info-edit-icon">✏️</span>
                 </div>
             </div>
             <div class="token-quota-inline" id="quota-inline-${escapeHtml(cardId)}">
-                <div class="quota-inline-header" onclick="toggleQuotaExpand('${escapeJs(cardId)}', '${safeRefreshToken}')">
+                <div class="quota-inline-header" onclick="toggleQuotaExpand('${escapeJs(cardId)}', '${safeTokenId}')">
                     <span class="quota-inline-summary" id="quota-summary-${escapeHtml(cardId)}">📊 加载中...</span>
                     <span class="quota-inline-toggle" id="quota-toggle-${escapeHtml(cardId)}">▼</span>
                 </div>
                 <div class="quota-inline-detail hidden" id="quota-detail-${escapeHtml(cardId)}"></div>
             </div>
             <div class="token-actions">
-                <button class="btn btn-info btn-xs" onclick="showQuotaModal('${safeRefreshToken}')" title="查看额度">📊 详情</button>
-                <button class="btn ${token.enable ? 'btn-warning' : 'btn-success'} btn-xs" onclick="toggleToken('${safeRefreshToken}', ${!token.enable})" title="${token.enable ? '禁用' : '启用'}">
+                <button class="btn btn-info btn-xs" onclick="showQuotaModal('${safeTokenId}')" title="查看额度">📊 详情</button>
+                <button class="btn ${token.enable ? 'btn-warning' : 'btn-success'} btn-xs" onclick="toggleToken('${safeTokenId}', ${!token.enable})" title="${token.enable ? '禁用' : '启用'}">
                     ${token.enable ? '⏸️ 禁用' : '▶️ 启用'}
                 </button>
-                <button class="btn btn-danger btn-xs" onclick="deleteToken('${safeRefreshToken}')" title="删除">🗑️ 删除</button>
+                <button class="btn btn-danger btn-xs" onclick="deleteToken('${safeTokenId}')" title="删除">🗑️ 删除</button>
             </div>
         </div>
     `}).join('');
     
     filteredTokens.forEach(token => {
-        loadTokenQuotaSummary(token.refresh_token);
+        loadTokenQuotaSummary(token.id);
     });
     
     updateSensitiveInfoDisplay();
@@ -160,21 +383,21 @@ function renderTokens(tokens) {
     skipAnimation = false;
 }
 
-// 手动刷新 Token
-async function manualRefreshToken(refreshToken) {
-    if (refreshingTokens.has(refreshToken)) {
+// 手动刷新 Token（使用 tokenId）
+async function manualRefreshToken(tokenId) {
+    if (refreshingTokens.has(tokenId)) {
         showToast('该 Token 正在刷新中', 'warning');
         return;
     }
-    await autoRefreshToken(refreshToken);
+    await autoRefreshToken(tokenId);
 }
 
-// 刷新指定 Token（手动触发）
-async function autoRefreshToken(refreshToken) {
-    if (refreshingTokens.has(refreshToken)) return;
+// 刷新指定 Token（手动触发，使用 tokenId）
+async function autoRefreshToken(tokenId) {
+    if (refreshingTokens.has(tokenId)) return;
     
-    refreshingTokens.add(refreshToken);
-    const cardId = refreshToken.substring(0, 8);
+    refreshingTokens.add(tokenId);
+    const cardId = tokenId.substring(0, 8);
     
     // 更新 UI 显示刷新中状态
     const card = document.getElementById(`card-${cardId}`);
@@ -190,16 +413,15 @@ async function autoRefreshToken(refreshToken) {
     }
     
     try {
-        const response = await authFetch(`/admin/tokens/${encodeURIComponent(refreshToken)}/refresh`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${authToken}` }
+        const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}/refresh`, {
+            method: 'POST'
         });
         
         const data = await response.json();
         if (data.success) {
             showToast('Token 已自动刷新', 'success');
             // 刷新成功后重新加载列表
-            refreshingTokens.delete(refreshToken);
+            refreshingTokens.delete(tokenId);
             if (card) card.classList.remove('refreshing');
             if (refreshBtn) {
                 refreshBtn.disabled = false;
@@ -209,7 +431,7 @@ async function autoRefreshToken(refreshToken) {
             loadTokens();
         } else {
             showToast(`Token 刷新失败: ${data.message || '未知错误'}`, 'error');
-            refreshingTokens.delete(refreshToken);
+            refreshingTokens.delete(tokenId);
             // 更新 UI 显示刷新失败
             if (card) {
                 card.classList.remove('refreshing');
@@ -225,7 +447,7 @@ async function autoRefreshToken(refreshToken) {
         if (error.message !== 'Unauthorized') {
             showToast(`Token 刷新失败: ${error.message}`, 'error');
         }
-        refreshingTokens.delete(refreshToken);
+        refreshingTokens.delete(tokenId);
         // 更新 UI 显示刷新失败
         if (card) {
             card.classList.remove('refreshing');
@@ -277,8 +499,7 @@ async function addTokenFromModal() {
         const response = await authFetch('/admin/tokens', {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
+                'Content-Type': 'application/json'
             },
             body: JSON.stringify({ access_token: accessToken, refresh_token: refreshToken, expires_in: expiresIn })
         });
@@ -298,7 +519,7 @@ async function addTokenFromModal() {
     }
 }
 
-function editField(event, refreshToken, field, currentValue) {
+function editField(event, tokenId, field, currentValue) {
     event.stopPropagation();
     const row = event.currentTarget;
     const valueSpan = row.querySelector('.info-value');
@@ -323,11 +544,10 @@ function editField(event, refreshToken, field, currentValue) {
         input.disabled = true;
         
         try {
-            const response = await authFetch(`/admin/tokens/${encodeURIComponent(refreshToken)}`, {
+            const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}`, {
                 method: 'PUT',
                 headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${authToken}`
+                    'Content-Type': 'application/json'
                 },
                 body: JSON.stringify({ [field]: newValue })
             });
@@ -373,17 +593,15 @@ function editField(event, refreshToken, field, currentValue) {
     });
 }
 
-function showTokenDetail(refreshToken) {
-    const token = cachedTokens.find(t => t.refresh_token === refreshToken);
+function showTokenDetail(tokenId) {
+    const token = cachedTokens.find(t => t.id === tokenId);
     if (!token) {
         showToast('Token不存在', 'error');
         return;
     }
     
     // 转义所有用户数据防止 XSS
-    const safeAccessToken = escapeHtml(token.access_token || '');
-    const safeRefreshToken = escapeHtml(token.refresh_token);
-    const safeRefreshTokenJs = escapeJs(refreshToken);
+    const safeTokenId = escapeJs(tokenId);
     const safeProjectId = escapeHtml(token.projectId || '');
     const safeEmail = escapeHtml(token.email || '');
     const updatedAtStr = escapeHtml(token.timestamp ? new Date(token.timestamp).toLocaleString('zh-CN') : '未知');
@@ -394,12 +612,8 @@ function showTokenDetail(refreshToken) {
         <div class="modal-content">
             <div class="modal-title">📝 Token详情</div>
             <div class="form-group compact">
-                <label>🎫 Access Token (只读)</label>
-                <div class="token-display">${safeAccessToken}</div>
-            </div>
-            <div class="form-group compact">
-                <label>🔄 Refresh Token (只读)</label>
-                <div class="token-display">${safeRefreshToken}</div>
+                <label>🔑 Token ID</label>
+                <div class="token-display">${escapeHtml(tokenId)}</div>
             </div>
             <div class="form-group compact">
                 <label>📦 Project ID</label>
@@ -415,7 +629,7 @@ function showTokenDetail(refreshToken) {
             </div>
             <div class="modal-actions">
                 <button class="btn btn-secondary" onclick="this.closest('.modal').remove()">取消</button>
-                <button class="btn btn-success" onclick="saveTokenDetail('${safeRefreshTokenJs}')">💾 保存</button>
+                <button class="btn btn-success" onclick="saveTokenDetail('${safeTokenId}')">💾 保存</button>
             </div>
         </div>
     `;
@@ -423,17 +637,16 @@ function showTokenDetail(refreshToken) {
     modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
 }
 
-async function saveTokenDetail(refreshToken) {
+async function saveTokenDetail(tokenId) {
     const projectId = document.getElementById('editProjectId').value.trim();
     const email = document.getElementById('editEmail').value.trim();
     
     showLoading('保存中...');
     try {
-        const response = await authFetch(`/admin/tokens/${encodeURIComponent(refreshToken)}`, {
+        const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}`, {
             method: 'PUT',
             headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
+                'Content-Type': 'application/json'
             },
             body: JSON.stringify({ projectId, email })
         });
@@ -453,18 +666,17 @@ async function saveTokenDetail(refreshToken) {
     }
 }
 
-async function toggleToken(refreshToken, enable) {
+async function toggleToken(tokenId, enable) {
     const action = enable ? '启用' : '禁用';
     const confirmed = await showConfirm(`确定要${action}这个Token吗？`, `${action}确认`);
     if (!confirmed) return;
     
     showLoading(`正在${action}...`);
     try {
-        const response = await authFetch(`/admin/tokens/${encodeURIComponent(refreshToken)}`, {
+        const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}`, {
             method: 'PUT',
             headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
+                'Content-Type': 'application/json'
             },
             body: JSON.stringify({ enable })
         });
@@ -484,15 +696,14 @@ async function toggleToken(refreshToken, enable) {
     }
 }
 
-async function deleteToken(refreshToken) {
+async function deleteToken(tokenId) {
     const confirmed = await showConfirm('删除后无法恢复，确定删除？', '⚠️ 删除确认');
     if (!confirmed) return;
     
     showLoading('正在删除...');
     try {
-        const response = await authFetch(`/admin/tokens/${encodeURIComponent(refreshToken)}`, {
-            method: 'DELETE',
-            headers: { 'Authorization': `Bearer ${authToken}` }
+        const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}`, {
+            method: 'DELETE'
         });
         
         const data = await response.json();

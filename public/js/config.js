@@ -10,9 +10,7 @@ function toggleRequestCountInput() {
 
 async function loadRotationStatus() {
     try {
-        const response = await authFetch('/admin/rotation', {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
+        const response = await authFetch('/admin/rotation');
         const data = await response.json();
         if (data.success) {
             const { strategy, requestCount, currentIndex } = data.data;
@@ -38,9 +36,7 @@ async function loadRotationStatus() {
 
 async function loadConfig() {
     try {
-        const response = await authFetch('/admin/config', {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
+        const response = await authFetch('/admin/config');
         const data = await response.json();
         if (data.success) {
             const form = document.getElementById('configForm');
@@ -72,9 +68,11 @@ async function loadConfig() {
                 if (form.elements['USE_NATIVE_AXIOS']) form.elements['USE_NATIVE_AXIOS'].checked = json.other.useNativeAxios !== false;
                 if (form.elements['USE_CONTEXT_SYSTEM_PROMPT']) form.elements['USE_CONTEXT_SYSTEM_PROMPT'].checked = json.other.useContextSystemPrompt || false;
                 if (form.elements['PASS_SIGNATURE_TO_CLIENT']) form.elements['PASS_SIGNATURE_TO_CLIENT'].checked = json.other.passSignatureToClient || false;
-                if (form.elements['USE_CACHED_SIGNATURE']) form.elements['USE_CACHED_SIGNATURE'].checked = json.other.useCachedSignature !== false;
                 if (form.elements['USE_FALLBACK_SIGNATURE']) form.elements['USE_FALLBACK_SIGNATURE'].checked = json.other.useFallbackSignature !== false;
-                if (form.elements['CACHE_ONLY_TOOL_SIGNATURES']) form.elements['CACHE_ONLY_TOOL_SIGNATURES'].checked = json.other.cacheOnlyToolSignatures || false;
+                if (form.elements['CACHE_ALL_SIGNATURES']) form.elements['CACHE_ALL_SIGNATURES'].checked = json.other.cacheAllSignatures || false;
+                if (form.elements['CACHE_TOOL_SIGNATURES']) form.elements['CACHE_TOOL_SIGNATURES'].checked = json.other.cacheToolSignatures !== false;
+                if (form.elements['CACHE_IMAGE_SIGNATURES']) form.elements['CACHE_IMAGE_SIGNATURES'].checked = json.other.cacheImageSignatures !== false;
+                if (form.elements['CACHE_THINKING']) form.elements['CACHE_THINKING'].checked = json.other.cacheThinking !== false;
             }
             if (json.rotation) {
                 if (form.elements['ROTATION_STRATEGY']) {
@@ -168,9 +166,11 @@ async function saveConfig(e) {
     jsonConfig.other.useNativeAxios = form.elements['USE_NATIVE_AXIOS']?.checked || false;
     jsonConfig.other.useContextSystemPrompt = form.elements['USE_CONTEXT_SYSTEM_PROMPT']?.checked || false;
     jsonConfig.other.passSignatureToClient = form.elements['PASS_SIGNATURE_TO_CLIENT']?.checked || false;
-    jsonConfig.other.useCachedSignature = form.elements['USE_CACHED_SIGNATURE']?.checked ?? true;
     jsonConfig.other.useFallbackSignature = form.elements['USE_FALLBACK_SIGNATURE']?.checked ?? true;
-    jsonConfig.other.cacheOnlyToolSignatures = form.elements['CACHE_ONLY_TOOL_SIGNATURES']?.checked || false;
+    jsonConfig.other.cacheAllSignatures = form.elements['CACHE_ALL_SIGNATURES']?.checked || false;
+    jsonConfig.other.cacheToolSignatures = form.elements['CACHE_TOOL_SIGNATURES']?.checked ?? true;
+    jsonConfig.other.cacheImageSignatures = form.elements['CACHE_IMAGE_SIGNATURES']?.checked ?? true;
+    jsonConfig.other.cacheThinking = form.elements['CACHE_THINKING']?.checked ?? true;
     
     Object.entries(allConfig).forEach(([key, value]) => {
         if (sensitiveKeys.includes(key)) {
@@ -194,7 +194,7 @@ async function saveConfig(e) {
                 const num = parseInt(value);
                 jsonConfig.other.retryTimes = Number.isNaN(num) ? undefined : num;
             }
-            else if (key === 'SKIP_PROJECT_ID_FETCH' || key === 'USE_NATIVE_AXIOS' || key === 'USE_CONTEXT_SYSTEM_PROMPT' || key === 'PASS_SIGNATURE_TO_CLIENT' || key === 'USE_CACHED_SIGNATURE' || key === 'USE_FALLBACK_SIGNATURE' || key === 'CACHE_ONLY_TOOL_SIGNATURES') {
+            else if (key === 'SKIP_PROJECT_ID_FETCH' || key === 'USE_NATIVE_AXIOS' || key === 'USE_CONTEXT_SYSTEM_PROMPT' || key === 'PASS_SIGNATURE_TO_CLIENT' || key === 'USE_FALLBACK_SIGNATURE' || key === 'CACHE_ALL_SIGNATURES' || key === 'CACHE_TOOL_SIGNATURES' || key === 'CACHE_IMAGE_SIGNATURES' || key === 'CACHE_THINKING') {
                 // 跳过，已在上面处理
             }
             else if (key === 'ROTATION_STRATEGY') jsonConfig.rotation.strategy = value || undefined;
@@ -219,8 +219,7 @@ async function saveConfig(e) {
         const response = await authFetch('/admin/config', {
             method: 'PUT',
             headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
+                'Content-Type': 'application/json'
             },
             body: JSON.stringify({ env: envConfig, json: jsonConfig })
         });
@@ -231,8 +230,7 @@ async function saveConfig(e) {
             await authFetch('/admin/rotation', {
                 method: 'PUT',
                 headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${authToken}`
+                    'Content-Type': 'application/json'
                 },
                 body: JSON.stringify(jsonConfig.rotation)
             });

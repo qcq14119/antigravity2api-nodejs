@@ -5,6 +5,7 @@
 
 import express from 'express';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
 import path from 'path';
 import { closeRequester } from '../api/client.js';
 import logger from '../utils/logger.js';
@@ -31,7 +32,11 @@ const app = express();
 memoryManager.start(config.server.memoryCleanupInterval);
 
 // ==================== 基础中间件 ====================
-app.use(cors());
+app.use(cors({
+  origin: true,
+  credentials: true
+}));
+app.use(cookieParser());
 app.use(express.json({ limit: config.security.maxRequestSize }));
 
 // 静态文件服务

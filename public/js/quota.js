@@ -6,23 +6,23 @@ const quotaCache = {
     data: {},
     ttl: 5 * 60 * 1000,
     
-    get(refreshToken) {
-        const cached = this.data[refreshToken];
+    get(tokenId) {
+        const cached = this.data[tokenId];
         if (!cached) return null;
         if (Date.now() - cached.timestamp > this.ttl) {
-            delete this.data[refreshToken];
+            delete this.data[tokenId];
             return null;
         }
         return cached.data;
     },
     
-    set(refreshToken, data) {
-        this.data[refreshToken] = { data, timestamp: Date.now() };
+    set(tokenId, data) {
+        this.data[tokenId] = { data, timestamp: Date.now() };
     },
     
-    clear(refreshToken) {
-        if (refreshToken) {
-            delete this.data[refreshToken];
+    clear(tokenId) {
+        if (tokenId) {
+            delete this.data[tokenId];
         } else {
             this.data = {};
         }
@@ -132,25 +132,24 @@ function summarizeGroup(items) {
     };
 }
 
-async function loadTokenQuotaSummary(refreshToken) {
-    const cardId = refreshToken.substring(0, 8);
+// 使用 tokenId 加载额度摘要
+async function loadTokenQuotaSummary(tokenId) {
+    const cardId = tokenId.substring(0, 8);
     const summaryEl = document.getElementById(`quota-summary-${cardId}`);
     if (!summaryEl) return;
     
-    const cached = quotaCache.get(refreshToken);
+    const cached = quotaCache.get(tokenId);
     if (cached) {
         renderQuotaSummary(summaryEl, cached);
         return;
     }
     
     try {
-        const response = await authFetch(`/admin/tokens/${encodeURIComponent(refreshToken)}/quotas`, {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
+        const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}/quotas`);
         const data = await response.json();
         
         if (data.success && data.data && data.data.models) {
-            quotaCache.set(refreshToken, data.data);
+            quotaCache.set(tokenId, data.data);
             renderQuotaSummary(summaryEl, data.data);
         } else {
             const errMsg = escapeHtml(data.message || '未知错误');
@@ -202,7 +201,7 @@ function renderQuotaSummary(summaryEl, quotaData) {
     `;
 }
 
-async function toggleQuotaExpand(cardId, refreshToken) {
+async function toggleQuotaExpand(cardId, tokenId) {
     const detailEl = document.getElementById(`quota-detail-${cardId}`);
     const toggleEl = document.getElementById(`quota-toggle-${cardId}`);
     if (!detailEl || !toggleEl) return;
@@ -216,7 +215,7 @@ async function toggleQuotaExpand(cardId, refreshToken) {
         
         if (!detailEl.dataset.loaded) {
             detailEl.innerHTML = '<div class="quota-loading-small">加载中...</div>';
-            await loadQuotaDetail(cardId, refreshToken);
+            await loadQuotaDetail(cardId, tokenId);
             detailEl.dataset.loaded = 'true';
         }
     } else {
@@ -232,14 +231,12 @@ async function toggleQuotaExpand(cardId, refreshToken) {
     }
 }
 
-async function loadQuotaDetail(cardId, refreshToken) {
+async function loadQuotaDetail(cardId, tokenId) {
     const detailEl = document.getElementById(`quota-detail-${cardId}`);
     if (!detailEl) return;
     
     try {
-        const response = await authFetch(`/admin/tokens/${encodeURIComponent(refreshToken)}/quotas`, {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
+        const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}/quotas`);
         const data = await response.json();
         
         if (data.success && data.data && data.data.models) {
@@ -283,7 +280,7 @@ async function loadQuotaDetail(cardId, refreshToken) {
             html += renderGroup(grouped.banana, getGroupIconHtml(groupByKey.banana));
             html += renderGroup(grouped.other, '');
             html += '</div>';
-            html += `<button class="btn btn-info btn-xs quota-refresh-btn" onclick="refreshInlineQuota('${escapeJs(cardId)}', '${escapeJs(refreshToken)}')">🔄 刷新额度</button>`;
+            html += `<button class="btn btn-info btn-xs quota-refresh-btn" onclick="refreshInlineQuota('${escapeJs(cardId)}', '${escapeJs(tokenId)}')">🔄 刷新额度</button>`;
             
             detailEl.innerHTML = html;
         } else {
@@ -297,33 +294,34 @@ async function loadQuotaDetail(cardId, refreshToken) {
     }
 }
 
-async function refreshInlineQuota(cardId, refreshToken) {
+async function refreshInlineQuota(cardId, tokenId) {
     const detailEl = document.getElementById(`quota-detail-${cardId}`);
     const summaryEl = document.getElementById(`quota-summary-${cardId}`);
     
     if (detailEl) detailEl.innerHTML = '<div class="quota-loading-small">刷新中...</div>';
     if (summaryEl) summaryEl.textContent = '📊 刷新中...';
     
-    quotaCache.clear(refreshToken);
+    quotaCache.clear(tokenId);
     
     try {
-        const response = await authFetch(`/admin/tokens/${encodeURIComponent(refreshToken)}/quotas?refresh=true`, {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
+        const response = await authFetch(`/admin/tokens/${encodeURIComponent(tokenId)}/quotas?refresh=true`);
         const data = await response.json();
         if (data.success && data.data) {
-            quotaCache.set(refreshToken, data.data);
+            quotaCache.set(tokenId, data.data);
         }
     } catch (e) {}
     
-    await loadTokenQuotaSummary(refreshToken);
-    await loadQuotaDetail(cardId, refreshToken);
+    await loadTokenQuotaSummary(tokenId);
+    await loadQuotaDetail(cardId, tokenId);
 }
 
-async function showQuotaModal(refreshToken) {
-    currentQuotaToken = refreshToken;
+// 存储当前弹窗的事件处理器引用，便于清理
+let quotaModalWheelHandler = null;
+
+async function showQuotaModal(tokenId) {
+    currentQuotaToken = tokenId;
     
-    const activeIndex = cachedTokens.findIndex(t => t.refresh_token === refreshToken);
+    const activeIndex = cachedTokens.findIndex(t => t.id === tokenId);
     
     const emailTabs = cachedTokens.map((t, index) => {
         const email = t.email || '未知';
@@ -350,32 +348,60 @@ async function showQuotaModal(refreshToken) {
                 <div class="quota-loading">加载中...</div>
             </div>
             <div class="modal-actions">
-                <button class="btn btn-secondary btn-sm" onclick="this.closest('.modal').remove()">关闭</button>
+                <button class="btn btn-secondary btn-sm" onclick="closeQuotaModal()">关闭</button>
                 <button class="btn btn-info btn-sm" id="quotaRefreshBtn" onclick="refreshQuotaData()">🔄 刷新</button>
             </div>
         </div>
     `;
     document.body.appendChild(modal);
-    modal.onclick = (e) => { if (e.target === modal) modal.remove(); };
     
-    await loadQuotaData(refreshToken);
+    // 关闭弹窗时清理事件监听器
+    modal.onclick = (e) => {
+        if (e.target === modal) {
+            closeQuotaModal();
+        }
+    };
+    
+    await loadQuotaData(tokenId);
     
     const tabsContainer = document.getElementById('quotaEmailList');
     if (tabsContainer) {
-        tabsContainer.addEventListener('wheel', (e) => {
+        // 创建事件处理器并保存引用
+        quotaModalWheelHandler = (e) => {
             if (e.deltaY !== 0) {
                 e.preventDefault();
                 tabsContainer.scrollLeft += e.deltaY;
             }
-        }, { passive: false });
+        };
+        tabsContainer.addEventListener('wheel', quotaModalWheelHandler, { passive: false });
     }
+}
+
+// 关闭额度弹窗并清理事件监听器
+function closeQuotaModal() {
+    const modal = document.getElementById('quotaModal');
+    
+    // 清理滚轮事件监听器
+    if (quotaModalWheelHandler) {
+        const tabsContainer = document.getElementById('quotaEmailList');
+        if (tabsContainer) {
+            tabsContainer.removeEventListener('wheel', quotaModalWheelHandler);
+        }
+        quotaModalWheelHandler = null;
+    }
+    
+    if (modal) {
+        modal.remove();
+    }
+    
+    currentQuotaToken = null;
 }
 
 async function switchQuotaAccountByIndex(index) {
     if (index < 0 || index >= cachedTokens.length) return;
     
     const token = cachedTokens[index];
-    currentQuotaToken = token.refresh_token;
+    currentQuotaToken = token.id;
     
     document.querySelectorAll('.quota-tab').forEach((tab, i) => {
         if (i === index) {
@@ -385,17 +411,17 @@ async function switchQuotaAccountByIndex(index) {
         }
     });
     
-    await loadQuotaData(token.refresh_token);
+    await loadQuotaData(token.id);
 }
 
-async function switchQuotaAccount(refreshToken) {
-    const index = cachedTokens.findIndex(t => t.refresh_token === refreshToken);
+async function switchQuotaAccount(tokenId) {
+    const index = cachedTokens.findIndex(t => t.id === tokenId);
     if (index >= 0) {
         await switchQuotaAccountByIndex(index);
     }
 }
 
-async function loadQuotaData(refreshToken, forceRefresh = false) {
+async function loadQuotaData(tokenId, forceRefresh = false) {
     const quotaContent = document.getElementById('quotaContent');
     if (!quotaContent) return;
     
@@ -406,7 +432,7 @@ async function loadQuotaData(refreshToken, forceRefresh = false) {
     }
     
     if (!forceRefresh) {
-        const cached = quotaCache.get(refreshToken);
+        const cached = quotaCache.get(tokenId);
         if (cached) {
             renderQuotaModal(quotaContent, cached);
             if (refreshBtn) {
@@ -416,21 +442,19 @@ async function loadQuotaData(refreshToken, forceRefresh = false) {
             return;
         }
     } else {
-        quotaCache.clear(refreshToken);
+        quotaCache.clear(tokenId);
     }
     
     quotaContent.innerHTML = '<div class="quota-loading">加载中...</div>';
     
     try {
-        const url = `/admin/tokens/${encodeURIComponent(refreshToken)}/quotas${forceRefresh ? '?refresh=true' : ''}`;
-        const response = await fetch(url, {
-            headers: { 'Authorization': `Bearer ${authToken}` }
-        });
+        const url = `/admin/tokens/${encodeURIComponent(tokenId)}/quotas${forceRefresh ? '?refresh=true' : ''}`;
+        const response = await authFetch(url);
         
         const data = await response.json();
         
         if (data.success) {
-            quotaCache.set(refreshToken, data.data);
+            quotaCache.set(tokenId, data.data);
             renderQuotaModal(quotaContent, data.data);
         } else {
             quotaContent.innerHTML = `<div class="quota-error">加载失败: ${escapeHtml(data.message)}</div>`;
@@ -450,6 +474,55 @@ async function loadQuotaData(refreshToken, forceRefresh = false) {
 async function refreshQuotaData() {
     if (currentQuotaToken) {
         await loadQuotaData(currentQuotaToken, true);
+    }
+}
+
+// 刷新所有 Token 的额度数据
+async function refreshAllQuotas() {
+    if (!cachedTokens || cachedTokens.length === 0) {
+        showToast('没有可刷新的 Token', 'warning');
+        return;
+    }
+    
+    const btn = document.getElementById('refreshQuotasBtn');
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = '⏳ 刷新中...';
+    }
+    
+    // 清除所有前端缓存
+    quotaCache.clear();
+    
+    try {
+        // 并行刷新所有 Token 的额度
+        const refreshPromises = cachedTokens.map(async (token) => {
+            try {
+                const response = await authFetch(`/admin/tokens/${encodeURIComponent(token.id)}/quotas?refresh=true`);
+                const data = await response.json();
+                if (data.success && data.data) {
+                    quotaCache.set(token.id, data.data);
+                }
+            } catch (e) {
+                // 单个 Token 刷新失败不影响其他
+                console.error(`刷新 Token ${token.email || token.id.substring(0, 8)} 额度失败:`, e);
+            }
+        });
+        
+        await Promise.all(refreshPromises);
+        
+        // 重新渲染所有额度摘要
+        cachedTokens.forEach(token => {
+            loadTokenQuotaSummary(token.id);
+        });
+        
+        showToast('所有额度已刷新', 'success');
+    } catch (error) {
+        showToast('刷新额度失败: ' + error.message, 'error');
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = '📊 刷新额度';
+        }
     }
 }
 

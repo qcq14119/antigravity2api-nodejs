@@ -93,7 +93,7 @@ function switchTab(tab, saveState = true) {
         void tokensPage.offsetWidth;
         tokensPage.classList.add('page-enter');
         // 进入 Token 页面时，从后端读取最新 token 列表
-        if (typeof loadTokens === 'function' && authToken) {
+        if (typeof loadTokens === 'function' && isLoggedIn) {
             loadTokens();
         }
     } else if (tab === 'settings') {
@@ -117,3 +117,4 @@ function restoreTabState() {
         switchTab(savedTab, false);
     }
 }
+

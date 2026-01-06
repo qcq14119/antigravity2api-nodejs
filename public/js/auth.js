@@ -1,6 +1,7 @@
 // 认证相关：登录、登出、OAuth
 
-let authToken = localStorage.getItem('authToken');
+// 不再使用 localStorage 存储 token，改用 HttpOnly Cookie
+let isLoggedIn = false;
 let oauthPort = null;
 
 const CLIENT_ID = '1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com';
@@ -12,9 +13,12 @@ const SCOPES = [
     'https://www.googleapis.com/auth/experimentsandconfigs'
 ].join(' ');
 
-// 封装fetch，自动处理401
+// 封装fetch，自动处理401，使用 credentials: 'include' 发送 Cookie
 const authFetch = async (url, options = {}) => {
-    const response = await fetch(url, options);
+    const response = await fetch(url, {
+        ...options,
+        credentials: 'include'
+    });
     if (response.status === 401) {
         silentLogout();
         showToast('登录已过期，请重新登录', 'warning');
@@ -24,14 +28,16 @@ const authFetch = async (url, options = {}) => {
 };
 
 function showMainContent() {
+    isLoggedIn = true;
     document.documentElement.classList.add('logged-in');
     document.getElementById('loginForm').classList.add('hidden');
     document.getElementById('mainContent').classList.remove('hidden');
 }
 
 function silentLogout() {
+    isLoggedIn = false;
+    // 清除旧版本的 localStorage token（如果存在）
     localStorage.removeItem('authToken');
-    authToken = null;
     document.documentElement.classList.remove('logged-in');
     document.getElementById('loginForm').classList.remove('hidden');
     document.getElementById('mainContent').classList.add('hidden');
@@ -40,6 +46,16 @@ function silentLogout() {
 async function logout() {
     const confirmed = await showConfirm('确定要退出登录吗？', '退出确认');
     if (!confirmed) return;
+    
+    try {
+        // 调用后端登出接口清除 Cookie
+        await fetch('/admin/logout', {
+            method: 'POST',
+            credentials: 'include'
+        });
+    } catch (e) {
+        // 忽略错误
+    }
     
     silentLogout();
     showToast('已退出登录', 'info');
@@ -119,8 +135,7 @@ async function processOAuthCallbackModal() {
         const response = await authFetch('/admin/oauth/exchange', {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${authToken}`
+                'Content-Type': 'application/json'
             },
             body: JSON.stringify({ code, port })
         });
@@ -131,8 +146,7 @@ async function processOAuthCallbackModal() {
             const addResponse = await authFetch('/admin/tokens', {
                 method: 'POST',
                 headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${authToken}`
+                    'Content-Type': 'application/json'
                 },
                 body: JSON.stringify(account)
             });
@@ -141,8 +155,8 @@ async function processOAuthCallbackModal() {
             hideLoading();
             if (addResult.success) {
                 modal.remove();
-                const message = result.fallbackMode 
-                    ? 'Token添加成功（该账号无资格，已自动使用随机ProjectId）' 
+                const message = result.fallbackMode
+                    ? 'Token添加成功（该账号无资格，已自动使用随机ProjectId）'
                     : 'Token添加成功';
                 showToast(message, result.fallbackMode ? 'warning' : 'success');
                 loadTokens();
@@ -156,5 +170,17 @@ async function processOAuthCallbackModal() {
     } catch (error) {
         hideLoading();
         showToast('处理失败: ' + error.message, 'error');
+    }
+}
+
+// 检查登录状态（通过尝试访问需要认证的接口）
+async function checkLoginStatus() {
+    try {
+        const response = await fetch('/admin/tokens', {
+            credentials: 'include'
+        });
+        return response.status === 200;
+    } catch (e) {
+        return false;
     }
 }

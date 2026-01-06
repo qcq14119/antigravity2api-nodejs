@@ -1,7 +1,7 @@
 // 转换器公共模块
 import config from '../../config/config.js';
 import { generateRequestId } from '../idGenerator.js';
-import { getReasoningSignature, getToolSignature } from '../thoughtSignatureCache.js';
+import { getSignature, shouldCacheSignature, isImageModel } from '../thoughtSignatureCache.js';
 import { setToolNameMapping } from '../toolNameCache.js';
 import { getThoughtSignatureForModel, getToolSignatureForModel, sanitizeToolName, modelMapping, isEnableThinking, generateGenerationConfig } from '../utils.js';
 
@@ -10,25 +10,45 @@ import { getThoughtSignatureForModel, getToolSignatureForModel, sanitizeToolName
  * @param {string} sessionId - 会话 ID
  * @param {string} actualModelName - 实际模型名称
  * @param {boolean} hasTools - 请求中是否包含工具定义
- * @returns {Object} 包含思维签名和工具签名的对象
+ * @returns {Object} 包含思维签名、思考内容和工具签名的对象
  */
 export function getSignatureContext(sessionId, actualModelName, hasTools = false) {
-  const cachedReasoningSig = config.useCachedSignature ? getReasoningSignature(sessionId, actualModelName) : null;
+  const isImage = isImageModel(actualModelName);
   
-  // 工具签名的获取逻辑：
-  // - 当 cacheOnlyToolSignatures 为 true 时，只有在 hasTools 为 true 时才从缓存获取
-  // - 当 cacheOnlyToolSignatures 为 false 时，总是从缓存获取（原有行为）
-  const shouldGetCachedToolSig = config.useCachedSignature && 
-    (!config.cacheOnlyToolSignatures || hasTools);
-  const cachedToolSig = shouldGetCachedToolSig ? getToolSignature(sessionId, actualModelName) : null;
+  // 判断是否应该从缓存获取签名
+  const shouldGetCached = shouldCacheSignature({ hasTools, isImageModel: isImage });
+  
+  // 从缓存获取签名+内容对象（现在返回 { signature, content } 或 null）
+  const cachedEntry = shouldGetCached ? getSignature(sessionId, actualModelName, { hasTools }) : null;
 
-  // 兜底签名逻辑也要遵循相同规则
-  const shouldUseFallbackToolSig = config.useFallbackSignature && 
-    (!config.cacheOnlyToolSignatures || hasTools);
+  // 构建返回值：优先使用缓存（包含签名+内容），回退到兜底签名（仅签名，无内容）
+  let reasoningSignature = null;
+  let reasoningContent = ' ';
+  let toolSignature = null;
+  let toolContent = ' ';
+
+  if (cachedEntry) {
+    // 统一缓存：同时用于 reasoning 和 tool
+    reasoningSignature = cachedEntry.signature;
+    reasoningContent = cachedEntry.content || ' ';
+    toolSignature = cachedEntry.signature;
+    toolContent = cachedEntry.content || ' ';
+  } else if (config.useFallbackSignature) {
+    // 兜底签名
+    reasoningSignature = getThoughtSignatureForModel(actualModelName);
+    reasoningContent = config.cacheThinking ? ' ' : ' '; // 兜底签名没有对应内容
+    
+    if (hasTools) {
+      toolSignature = getToolSignatureForModel(actualModelName);
+      toolContent = ' ';
+    }
+  }
 
   return {
-    reasoningSignature: cachedReasoningSig || (config.useFallbackSignature ? getThoughtSignatureForModel(actualModelName) : null),
-    toolSignature: cachedToolSig || (shouldUseFallbackToolSig ? getToolSignatureForModel(actualModelName) : null)
+    reasoningSignature,
+    reasoningContent,
+    toolSignature,
+    toolContent
   };
 }
 

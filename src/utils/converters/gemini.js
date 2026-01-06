@@ -51,9 +51,10 @@ function processFunctionCallIds(contents) {
 /**
  * 处理 model 消息中的 thought 和签名
  */
-function processModelThoughts(content, reasoningSignature, toolSignature, enableThinking) {
+function processModelThoughts(content, reasoningSignature, reasoningContent, toolSignature, toolContent, enableThinking) {
   const parts = content.parts;
   const fallbackSig = reasoningSignature || toolSignature;
+  const fallbackContent = (fallbackSig === reasoningSignature) ? (reasoningContent || ' ') : (toolContent || ' ');
 
   // 非思考模型：仅为 inlineData 自动补签名（避免历史消息回放时报缺签名）
   if (!enableThinking) {
@@ -99,7 +100,8 @@ function processModelThoughts(content, reasoningSignature, toolSignature, enable
     if (fallbackSig) parts[thoughtIndex].thoughtSignature = fallbackSig;
   } else if (thoughtIndex === -1 && fallbackSig) {
     // 只有在有签名时才添加 thought part，避免 API 报错
-    parts.unshift(createThoughtPart(' ', fallbackSig));
+    // 使用与签名绑定的缓存内容
+    parts.unshift(createThoughtPart(fallbackContent, fallbackSig));
   }
   
   // 收集独立的签名 parts（用于 functionCall）
@@ -150,11 +152,11 @@ export function generateGeminiRequestBody(geminiBody, modelName, token) {
     }
     
     const hasTools = request.tools && request.tools.length > 0;
-    const { reasoningSignature, toolSignature } = getSignatureContext(token.sessionId, actualModelName, hasTools);
+    const { reasoningSignature, reasoningContent, toolSignature, toolContent } = getSignatureContext(token.sessionId, actualModelName, hasTools);
 
     request.contents.forEach(content => {
       if (content.role === 'model' && content.parts && Array.isArray(content.parts)) {
-        processModelThoughts(content, reasoningSignature, toolSignature, enableThinking);
+        processModelThoughts(content, reasoningSignature, reasoningContent, toolSignature, toolContent, enableThinking);
       }
     });
   }

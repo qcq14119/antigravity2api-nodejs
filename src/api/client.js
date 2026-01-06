@@ -16,7 +16,7 @@ import {
   convertToToolCall,
   registerStreamMemoryCleanup
 } from './stream_parser.js';
-import { setReasoningSignature, setToolSignature } from '../utils/thoughtSignatureCache.js';
+import { setSignature, shouldCacheSignature, isImageModel } from '../utils/thoughtSignatureCache.js';
 
 // 请求客户端：优先使用 AntigravityRequester，失败则降级到 axios
 let requester = null;
@@ -482,28 +482,31 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
     total_tokens: usage.totalTokenCount || 0
   } : null;
   
-  // 将新的签名写入全局缓存（按 model），供后续请求兜底使用
+  // 将新的签名和思考内容写入全局缓存（按 model），供后续请求兜底使用
   const sessionId = requestBody.request?.sessionId;
   const model = requestBody.model;
-  if (config.useCachedSignature && sessionId && model) {
-    if (reasoningSignature) {
-      setReasoningSignature(sessionId, model, reasoningSignature);
-    }
-    // 工具签名：取最后一个带 thoughtSignature 的工具作为缓存源（更接近“最新”）
-    let toolSig = null;
-    for (let i = toolCalls.length - 1; i >= 0; i--) {
-      const sig = toolCalls[i]?.thoughtSignature;
-      if (sig) {
-        toolSig = sig;
-        break;
+  const hasTools = toolCalls.length > 0;
+  const isImage = isImageModel(model);
+  
+  // 判断是否应该缓存签名
+  if (sessionId && model && shouldCacheSignature({ hasTools, isImageModel: isImage })) {
+    // 获取最终使用的签名（优先使用工具签名，回退到思维签名）
+    let finalSignature = reasoningSignature;
+    
+    // 工具签名：取最后一个带 thoughtSignature 的工具作为缓存源（更接近"最新"）
+    if (hasTools) {
+      for (let i = toolCalls.length - 1; i >= 0; i--) {
+        const sig = toolCalls[i]?.thoughtSignature;
+        if (sig) {
+          finalSignature = sig;
+          break;
+        }
       }
     }
-    // 若上游不在 functionCall 上附带签名，则默认沿用同一轮生成中的思维签名
-    if (!toolSig && reasoningSignature && toolCalls.length > 0) {
-      toolSig = reasoningSignature;
-    }
-    if (toolSig) {
-      setToolSignature(sessionId, model, toolSig);
+    
+    if (finalSignature) {
+      const cachedContent = reasoningContent || ' ';
+      setSignature(sessionId, model, finalSignature, cachedContent, { hasTools, isImageModel: isImage });
     }
   }
 

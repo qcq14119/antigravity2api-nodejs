@@ -1,6 +1,6 @@
 import axios from 'axios';
 import { log } from '../utils/logger.js';
-import { generateSessionId, generateProjectId } from '../utils/idGenerator.js';
+import { generateSessionId, generateProjectId, generateTokenId } from '../utils/idGenerator.js';
 import config, { getConfigJson } from '../config/config.js';
 import { OAUTH_CONFIG } from '../constants/oauth.js';
 import { buildAxiosRequestConfig } from '../utils/httpClient.js';
@@ -618,11 +618,11 @@ class TokenManager {
   async getTokenList() {
     try {
       const allTokens = await this.store.readAll();
+      const salt = await this.store.getSalt();
       
       return allTokens.map(token => ({
-        refresh_token: token.refresh_token,
-        access_token: token.access_token,
-        access_token_suffix: token.access_token ? `...${token.access_token.slice(-8)}` : 'N/A',
+        // 使用安全的 tokenId 替代完整的 refresh_token
+        id: generateTokenId(token.refresh_token, salt),
         expires_in: token.expires_in,
         timestamp: token.timestamp,
         enable: token.enable !== false,
@@ -634,6 +634,109 @@ class TokenManager {
       log.error('获取Token列表失败:', error.message);
       return [];
     }
+  }
+
+  /**
+   * 根据 tokenId 查找完整的 token 对象
+   * @param {string} tokenId - 安全的 token ID
+   * @returns {Promise<Object|null>} token 对象或 null
+   */
+  async findTokenById(tokenId) {
+    try {
+      const allTokens = await this.store.readAll();
+      const salt = await this.store.getSalt();
+      
+      return allTokens.find(token =>
+        generateTokenId(token.refresh_token, salt) === tokenId
+      ) || null;
+    } catch (error) {
+      log.error('查找Token失败:', error.message);
+      return null;
+    }
+  }
+
+  /**
+   * 根据 tokenId 更新 token
+   * @param {string} tokenId - 安全的 token ID
+   * @param {Object} updates - 更新内容
+   * @returns {Promise<Object>} 操作结果
+   */
+  async updateTokenById(tokenId, updates) {
+    try {
+      const allTokens = await this.store.readAll();
+      const salt = await this.store.getSalt();
+      
+      const index = allTokens.findIndex(token =>
+        generateTokenId(token.refresh_token, salt) === tokenId
+      );
+      
+      if (index === -1) {
+        return { success: false, message: 'Token不存在' };
+      }
+      
+      allTokens[index] = { ...allTokens[index], ...updates };
+      await this.store.writeAll(allTokens);
+      
+      await this.reload();
+      return { success: true, message: 'Token更新成功' };
+    } catch (error) {
+      log.error('更新Token失败:', error.message);
+      return { success: false, message: error.message };
+    }
+  }
+
+  /**
+   * 根据 tokenId 删除 token
+   * @param {string} tokenId - 安全的 token ID
+   * @returns {Promise<Object>} 操作结果
+   */
+  async deleteTokenById(tokenId) {
+    try {
+      const allTokens = await this.store.readAll();
+      const salt = await this.store.getSalt();
+      
+      const filteredTokens = allTokens.filter(token =>
+        generateTokenId(token.refresh_token, salt) !== tokenId
+      );
+      
+      if (filteredTokens.length === allTokens.length) {
+        return { success: false, message: 'Token不存在' };
+      }
+      
+      await this.store.writeAll(filteredTokens);
+      
+      await this.reload();
+      return { success: true, message: 'Token删除成功' };
+    } catch (error) {
+      log.error('删除Token失败:', error.message);
+      return { success: false, message: error.message };
+    }
+  }
+
+  /**
+   * 根据 tokenId 刷新 token
+   * @param {string} tokenId - 安全的 token ID
+   * @returns {Promise<Object>} 刷新后的 token 信息（不含敏感数据）
+   */
+  async refreshTokenById(tokenId) {
+    const tokenData = await this.findTokenById(tokenId);
+    if (!tokenData) {
+      throw new TokenError('Token不存在', null, 404);
+    }
+    
+    const refreshedToken = await this.refreshToken(tokenData);
+    return {
+      expires_in: refreshedToken.expires_in,
+      timestamp: refreshedToken.timestamp
+    };
+  }
+
+  /**
+   * 获取盐值（用于前端验证等场景）
+   * @returns {Promise<string>} 盐值
+   */
+  async getSalt() {
+    return this.store.getSalt();
   }
 
   // 获取当前轮询配置

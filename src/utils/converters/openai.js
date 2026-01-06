@@ -47,7 +47,7 @@ function extractImagesFromContent(content) {
 function handleAssistantMessage(message, antigravityMessages, enableThinking, actualModelName, sessionId, hasTools) {
   const hasToolCalls = message.tool_calls && message.tool_calls.length > 0;
   const hasContent = message.content && message.content.trim() !== '';
-  const { reasoningSignature, toolSignature } = getSignatureContext(sessionId, actualModelName, hasTools);
+  const { reasoningSignature, reasoningContent, toolSignature, toolContent } = getSignatureContext(sessionId, actualModelName, hasTools);
 
   const toolCalls = hasToolCalls
     ? message.tool_calls.map(toolCall => {
@@ -61,9 +61,24 @@ function handleAssistantMessage(message, antigravityMessages, enableThinking, ac
 
   const parts = [];
   if (enableThinking) {
-    const reasoningText = (typeof message.reasoning_content === 'string' && message.reasoning_content.length > 0)
-      ? message.reasoning_content : ' ';
-    const signature = message.thoughtSignature || reasoningSignature || toolSignature;
+    // 优先使用消息自带的思考内容，否则使用缓存的内容（与签名绑定）
+    let reasoningText = ' ';
+    let signature = null;
+    
+    if (typeof message.reasoning_content === 'string' && message.reasoning_content.length > 0) {
+      // 消息自带思考内容，使用消息自带的签名或缓存签名
+      reasoningText = message.reasoning_content;
+      signature = message.thoughtSignature || reasoningSignature || toolSignature;
+    } else {
+      // 没有思考内容，使用缓存的签名+内容（绑定关系）
+      signature = message.thoughtSignature || reasoningSignature || toolSignature;
+      if (signature === reasoningSignature) {
+        reasoningText = reasoningContent || ' ';
+      } else if (signature === toolSignature) {
+        reasoningText = toolContent || ' ';
+      }
+    }
+    
     // 只有在有签名时才添加 thought part，避免 API 报错
     if (signature) {
       parts.push(createThoughtPart(reasoningText, signature));

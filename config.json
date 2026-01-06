@@ -34,9 +34,11 @@
     "useNativeAxios": false,
     "useContextSystemPrompt": true,
     "passSignatureToClient": false,
-    "debugDumpRequestResponse": false,
-    "useCachedSignature": false,
+    "debugDumpRequestResponse": true,
     "useFallbackSignature": false,
-    "cacheOnlyToolSignatures": false
+    "cacheAllSignatures": false,
+    "cacheToolSignatures": true,
+    "cacheImageSignatures": true,
+    "cacheThinking": true
   }
 }

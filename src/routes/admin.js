@@ -1,5 +1,5 @@
 import express from 'express';
-import { generateToken, authMiddleware } from '../auth/jwt.js';
+import { generateToken, authMiddleware, verifyToken } from '../auth/jwt.js';
 import tokenManager from '../auth/token_manager.js';
 import quotaManager from '../auth/quota_manager.js';
 import oauthManager from '../auth/oauth_manager.js';
@@ -16,6 +16,40 @@ import dotenv from 'dotenv';
 const envPath = getEnvPath();
 
 const router = express.Router();
+
+// Cookie 配置
+const COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'strict',
+  maxAge: 24 * 60 * 60 * 1000 // 24小时
+};
+
+// 从 Cookie 或 Header 获取 JWT Token 的中间件
+const cookieAuthMiddleware = (req, res, next) => {
+  // 优先从 Cookie 获取
+  let token = req.cookies?.authToken;
+  
+  // 如果 Cookie 中没有，尝试从 Header 获取（兼容旧版本）
+  if (!token) {
+    const authHeader = req.headers.authorization;
+    token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  }
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Token required' });
+  }
+  
+  try {
+    const decoded = verifyToken(token);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    // 清除无效的 Cookie
+    res.clearCookie('authToken');
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+};
 
 // 登录速率限制 - 防止暴力破解
 const loginAttempts = new Map(); // IP -> { count, lastAttempt, blockedUntil }
@@ -108,6 +142,11 @@ router.post('/login', (req, res) => {
   if (username === config.admin.username && password === config.admin.password) {
     recordLoginAttempt(clientIP, true);
     const token = generateToken({ username, role: 'admin' });
+    
+    // 设置 HttpOnly Cookie
+    res.cookie('authToken', token, COOKIE_OPTIONS);
+    
+    // 同时返回 token（兼容旧版本前端）
     res.json({ success: true, token });
   } else {
     recordLoginAttempt(clientIP, false);
@@ -115,8 +154,19 @@ router.post('/login', (req, res) => {
   }
 });
 
-// Token管理API - 需要JWT认证
-router.get('/tokens', authMiddleware, async (req, res) => {
+// 登出接口
+router.post('/logout', (req, res) => {
+  res.clearCookie('authToken');
+  res.json({ success: true, message: '已登出' });
+});
+
+// 验证密码（用于敏感操作）
+function verifyPassword(password) {
+  return password === config.admin.password;
+}
+
+// Token管理API - 需要JWT认证（使用 Cookie 优先）
+router.get('/tokens', cookieAuthMiddleware, async (req, res) => {
   try {
     const tokens = await tokenManager.getTokenList();
     res.json({ success: true, data: tokens });
@@ -126,7 +176,7 @@ router.get('/tokens', authMiddleware, async (req, res) => {
   }
 });
 
-router.post('/tokens', authMiddleware, async (req, res) => {
+router.post('/tokens', cookieAuthMiddleware, async (req, res) => {
   const { access_token, refresh_token, expires_in, timestamp, enable, projectId, email } = req.body;
   if (!access_token || !refresh_token) {
     return res.status(400).json({ success: false, message: 'access_token和refresh_token必填' });
@@ -146,11 +196,17 @@ router.post('/tokens', authMiddleware, async (req, res) => {
   }
 });
 
-router.put('/tokens/:refreshToken', authMiddleware, async (req, res) => {
-  const { refreshToken } = req.params;
+// 使用 tokenId 替代 refreshToken
+router.put('/tokens/:tokenId', cookieAuthMiddleware, async (req, res) => {
+  const { tokenId } = req.params;
   const updates = req.body;
+  
+  // 不允许通过 API 更新敏感字段
+  delete updates.access_token;
+  delete updates.refresh_token;
+  
   try {
-    const result = await tokenManager.updateToken(refreshToken, updates);
+    const result = await tokenManager.updateTokenById(tokenId, updates);
     res.json(result);
   } catch (error) {
     logger.error('更新Token失败:', error.message);
@@ -158,10 +214,10 @@ router.put('/tokens/:refreshToken', authMiddleware, async (req, res) => {
   }
 });
 
-router.delete('/tokens/:refreshToken', authMiddleware, async (req, res) => {
-  const { refreshToken } = req.params;
+router.delete('/tokens/:tokenId', cookieAuthMiddleware, async (req, res) => {
+  const { tokenId } = req.params;
   try {
-    const result = await tokenManager.deleteToken(refreshToken);
+    const result = await tokenManager.deleteTokenById(tokenId);
     res.json(result);
   } catch (error) {
     logger.error('删除Token失败:', error.message);
@@ -169,7 +225,7 @@ router.delete('/tokens/:refreshToken', authMiddleware, async (req, res) => {
   }
 });
 
-router.post('/tokens/reload', authMiddleware, async (req, res) => {
+router.post('/tokens/reload', cookieAuthMiddleware, async (req, res) => {
   try {
     await tokenManager.reload();
     res.json({ success: true, message: 'Token已热重载' });
@@ -179,27 +235,118 @@ router.post('/tokens/reload', authMiddleware, async (req, res) => {
   }
 });
 
-// 刷新指定Token的access_token
-router.post('/tokens/:refreshToken/refresh', authMiddleware, async (req, res) => {
-  const { refreshToken } = req.params;
+// 刷新指定Token的access_token（使用 tokenId）
+router.post('/tokens/:tokenId/refresh', cookieAuthMiddleware, async (req, res) => {
+  const { tokenId } = req.params;
   try {
-    const tokens = await tokenManager.getTokenList();
-    const tokenData = tokens.find(t => t.refresh_token === refreshToken);
-    
-    if (!tokenData) {
-      return res.status(404).json({ success: false, message: 'Token不存在' });
-    }
-    
-    // 调用 tokenManager 的刷新方法
-    const refreshedToken = await tokenManager.refreshToken(tokenData);
-    res.json({ success: true, message: 'Token刷新成功', data: { expires_in: refreshedToken.expires_in, timestamp: refreshedToken.timestamp } });
+    const result = await tokenManager.refreshTokenById(tokenId);
+    res.json({ success: true, message: 'Token刷新成功', data: result });
   } catch (error) {
     logger.error('刷新Token失败:', error.message);
+    const status = error.statusCode || 500;
+    res.status(status).json({ success: false, message: error.message });
+  }
+});
+
+// 导出所有 Token（需要密码验证）
+router.post('/tokens/export', cookieAuthMiddleware, async (req, res) => {
+  const { password } = req.body;
+  
+  if (!password || !verifyPassword(password)) {
+    return res.status(403).json({ success: false, message: '密码验证失败' });
+  }
+  
+  try {
+    const allTokens = await tokenManager.store.readAll();
+    
+    // 导出格式：包含完整的 token 数据
+    const exportData = {
+      version: 1,
+      exportTime: new Date().toISOString(),
+      tokens: allTokens.map(token => ({
+        access_token: token.access_token,
+        refresh_token: token.refresh_token,
+        expires_in: token.expires_in,
+        timestamp: token.timestamp,
+        enable: token.enable,
+        projectId: token.projectId,
+        email: token.email,
+        hasQuota: token.hasQuota
+      }))
+    };
+    
+    res.json({ success: true, data: exportData });
+  } catch (error) {
+    logger.error('导出Token失败:', error.message);
     res.status(500).json({ success: false, message: error.message });
   }
 });
 
-router.post('/oauth/exchange', authMiddleware, async (req, res) => {
+// 导入 Token（需要密码验证）
+router.post('/tokens/import', cookieAuthMiddleware, async (req, res) => {
+  const { password, data, mode = 'merge' } = req.body;
+  
+  if (!password || !verifyPassword(password)) {
+    return res.status(403).json({ success: false, message: '密码验证失败' });
+  }
+  
+  if (!data || !data.tokens || !Array.isArray(data.tokens)) {
+    return res.status(400).json({ success: false, message: '无效的导入数据格式' });
+  }
+  
+  try {
+    const importTokens = data.tokens;
+    let addedCount = 0;
+    let skippedCount = 0;
+    let updatedCount = 0;
+    
+    if (mode === 'replace') {
+      // 替换模式：清空现有数据，导入新数据
+      const validTokens = importTokens.filter(t => t.access_token && t.refresh_token);
+      await tokenManager.store.writeAll(validTokens);
+      addedCount = validTokens.length;
+    } else {
+      // 合并模式：根据 refresh_token 去重
+      const existingTokens = await tokenManager.store.readAll();
+      const existingRefreshTokens = new Set(existingTokens.map(t => t.refresh_token));
+      
+      for (const token of importTokens) {
+        if (!token.access_token || !token.refresh_token) {
+          skippedCount++;
+          continue;
+        }
+        
+        if (existingRefreshTokens.has(token.refresh_token)) {
+          // 更新已存在的 token
+          const index = existingTokens.findIndex(t => t.refresh_token === token.refresh_token);
+          if (index !== -1) {
+            existingTokens[index] = { ...existingTokens[index], ...token };
+            updatedCount++;
+          }
+        } else {
+          // 添加新 token
+          existingTokens.push(token);
+          addedCount++;
+        }
+      }
+      
+      await tokenManager.store.writeAll(existingTokens);
+    }
+    
+    await tokenManager.reload();
+    
+    res.json({
+      success: true,
+      message: `导入完成：新增 ${addedCount} 个，更新 ${updatedCount} 个，跳过 ${skippedCount} 个`,
+      data: { added: addedCount, updated: updatedCount, skipped: skippedCount }
+    });
+  } catch (error) {
+    logger.error('导入Token失败:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+router.post('/oauth/exchange', cookieAuthMiddleware, async (req, res) => {
   const { code, port } = req.body;
   if (!code || !port) {
     return res.status(400).json({ success: false, message: 'code和port必填' });
@@ -218,7 +365,7 @@ router.post('/oauth/exchange', authMiddleware, async (req, res) => {
 });
 
 // 获取配置
-router.get('/config', authMiddleware, (req, res) => {
+router.get('/config', cookieAuthMiddleware, (req, res) => {
   try {
     const envData = parseEnvFile(envPath);
     const jsonData = getConfigJson();
@@ -230,7 +377,7 @@ router.get('/config', authMiddleware, (req, res) => {
 });
 
 // 更新配置
-router.put('/config', authMiddleware, (req, res) => {
+router.put('/config', cookieAuthMiddleware, (req, res) => {
   try {
     const { env: envUpdates, json: jsonUpdates } = req.body;
     
@@ -252,7 +399,7 @@ router.put('/config', authMiddleware, (req, res) => {
 });
 
 // 获取轮询策略配置
-router.get('/rotation', authMiddleware, (req, res) => {
+router.get('/rotation', cookieAuthMiddleware, (req, res) => {
   try {
     const rotationConfig = tokenManager.getRotationConfig();
     res.json({ success: true, data: rotationConfig });
@@ -263,7 +410,7 @@ router.get('/rotation', authMiddleware, (req, res) => {
 });
 
 // 更新轮询策略配置
-router.put('/rotation', authMiddleware, (req, res) => {
+router.put('/rotation', cookieAuthMiddleware, (req, res) => {
   try {
     const { strategy, requestCount } = req.body;
     
@@ -297,13 +444,14 @@ router.put('/rotation', authMiddleware, (req, res) => {
   }
 });
 
-// 获取指定Token的模型额度
-router.get('/tokens/:refreshToken/quotas', authMiddleware, async (req, res) => {
+// 获取指定Token的模型额度（使用 tokenId）
+router.get('/tokens/:tokenId/quotas', cookieAuthMiddleware, async (req, res) => {
   try {
-    const { refreshToken } = req.params;
+    const { tokenId } = req.params;
     const forceRefresh = req.query.refresh === 'true';
-    const tokens = await tokenManager.getTokenList();
-    let tokenData = tokens.find(t => t.refresh_token === refreshToken);
+    
+    // 通过 tokenId 查找完整的 token 数据
+    let tokenData = await tokenManager.findTokenById(tokenId);
     
     if (!tokenData) {
       return res.status(404).json({ success: false, message: 'Token不存在' });
@@ -320,14 +468,13 @@ router.get('/tokens/:refreshToken/quotas', authMiddleware, async (req, res) => {
       }
     }
     
-    // 先从缓存获取（除非强制刷新）
-    let quotaData = forceRefresh ? null : quotaManager.getQuota(refreshToken);
+    // 使用 tokenId 作为缓存键
+    let quotaData = forceRefresh ? null : quotaManager.getQuota(tokenId);
     
     if (!quotaData) {
       // 缓存未命中或强制刷新，从API获取
-      const token = { access_token: tokenData.access_token, refresh_token: refreshToken };
-      const quotas = await getModelsWithQuotas(token);
-      quotaManager.updateQuota(refreshToken, quotas);
+      const quotas = await getModelsWithQuotas(tokenData);
+      quotaManager.updateQuota(tokenId, quotas);
       quotaData = { lastUpdated: Date.now(), models: quotas };
     }
     
@@ -341,12 +488,12 @@ router.get('/tokens/:refreshToken/quotas', authMiddleware, async (req, res) => {
       };
     });
     
-    res.json({ 
-      success: true, 
-      data: { 
+    res.json({
+      success: true,
+      data: {
         lastUpdated: quotaData.lastUpdated,
-        models: modelsWithBeijingTime 
-      } 
+        models: modelsWithBeijingTime
+      }
     });
   } catch (error) {
     logger.error('获取额度失败:', error.message);
