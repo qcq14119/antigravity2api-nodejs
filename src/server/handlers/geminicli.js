@@ -55,7 +55,6 @@ export const handleGeminiCliRequest = async (req, res, forceFormat = null) => {
     if (!token) {
       throw new Error('没有可用的 Gemini CLI token，请在管理页面添加账号');
     }
-
     const { geminiRequest, model: actualModel, features, sourceFormat } = convertToGeminiCli(cleanedBody);
     
 

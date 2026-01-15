@@ -148,10 +148,9 @@ export function toGenerationConfig(normalized, enableThinking, actualModelName) 
   const defaultThinkingBudget = config.defaults.thinking_budget ?? 1024;
   let thinkingBudget = 0;
   let actualEnableThinking = enableThinking;
-  
   if (enableThinking) {
     if (normalized.thinking_budget !== undefined) {
-      thinkingBudget = normalized.thinking_budget;
+      thinkingBudget = normalized.thinking_budget || normalized.thinkingBudget;
       // 如果用户显式设置 thinking_budget = 0，则禁用思考
       if (thinkingBudget === 0) {
         actualEnableThinking = false;
