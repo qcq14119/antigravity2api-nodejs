@@ -133,7 +133,7 @@ export function createFunctionCallPart(id, name, args, signature = null) {
     functionCall: {
       id,
       name,
-      args: typeof args === 'string' ? { query: args } : args
+      args: typeof args === 'string' ? JSON.parse(args) : args
     }
   };
   if (signature) {
