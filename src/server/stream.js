@@ -6,7 +6,9 @@
 import config from '../config/config.js';
 import logger from '../utils/logger.js';
 import memoryManager, { registerMemoryPoolCleanup } from '../utils/memoryManager.js';
-import { DEFAULT_HEARTBEAT_INTERVAL } from '../constants/index.js';
+import { DEFAULT_HEARTBEAT_INTERVAL, LONG_COOLDOWN_THRESHOLD } from '../constants/index.js';
+import tokenCooldownManager from '../auth/token_cooldown_manager.js';
+import quotaManager from '../auth/quota_manager.js';
 
 // ==================== 心跳机制（防止 CF 超时） ====================
 const HEARTBEAT_INTERVAL = config.server.heartbeatInterval || DEFAULT_HEARTBEAT_INTERVAL;
@@ -242,16 +244,66 @@ function computeBackoffMs(attempt, explicitDelayMs) {
 }
 
 /**
+ * 从 429 错误中提取恢复时间戳（毫秒）
+ * @param {Error} error - 错误对象
+ * @returns {number|null} 恢复时间戳，如果无法解析返回 null
+ */
+function getUpstreamResetTimestamp(error) {
+  const body = extractUpstreamErrorBody(error);
+  const root = (body && typeof body === 'object') ? body : null;
+  const inner = root?.error || root;
+  const details = Array.isArray(inner?.details) ? inner.details : [];
+
+  for (const d of details) {
+    if (!d || typeof d !== 'object') continue;
+    const meta = d.metadata && typeof d.metadata === 'object' ? d.metadata : null;
+    const ts = meta?.quotaResetTimeStamp;
+    if (typeof ts === 'string') {
+      const t = Date.parse(ts);
+      if (Number.isFinite(t)) {
+        return t;
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * 带 429 重试的执行器
  * @param {Function} fn - 要执行的异步函数，接收 attempt 参数
  * @param {number} maxRetries - 最大重试次数
- * @param {string} loggerPrefix - 日志前缀
- * @param {Function} onAttempt - 可选，每次尝试时的回调（用于记录请求次数）
+ * @param {Object} options - 可选参数
+ * @param {string} options.loggerPrefix - 日志前缀
+ * @param {Function} options.onAttempt - 每次尝试时的回调（用于记录请求次数）
+ * @param {string} options.tokenId - Token ID（用于模型系列禁用）
+ * @param {string} options.modelId - 模型 ID（用于模型系列禁用）
+ * @param {Function} options.refreshQuota - 刷新额度的回调函数（当需要获取准确恢复时间时调用）
  * @returns {Promise<any>}
  */
-export const with429Retry = async (fn, maxRetries, loggerPrefix = '', onAttempt = null) => {
+export const with429Retry = async (fn, maxRetries, options = {}) => {
+  // 兼容旧版调用方式：with429Retry(fn, maxRetries, loggerPrefix, onAttempt)
+  let loggerPrefix = '';
+  let onAttempt = null;
+  let tokenId = null;
+  let modelId = null;
+  let refreshQuota = null;
+
+  if (typeof options === 'string') {
+    // 旧版调用方式
+    loggerPrefix = options;
+    onAttempt = arguments[3] || null;
+  } else if (typeof options === 'object' && options !== null) {
+    loggerPrefix = options.loggerPrefix || '';
+    onAttempt = options.onAttempt || null;
+    tokenId = options.tokenId || null;
+    modelId = options.modelId || null;
+    refreshQuota = options.refreshQuota || null;
+  }
+
   const retries = Number.isFinite(maxRetries) && maxRetries > 0 ? Math.floor(maxRetries) : 0;
+  const cooldownThreshold = config.quota?.longCooldownThreshold || LONG_COOLDOWN_THRESHOLD;
   let attempt = 0;
+
   // 首次执行 + 最多 retries 次重试
   while (true) {
     try {
@@ -263,17 +315,62 @@ export const with429Retry = async (fn, maxRetries, loggerPrefix = '', onAttempt 
     } catch (error) {
       // 兼容多种错误格式：error.status, error.statusCode, error.response?.status
       const status = Number(error.status || error.statusCode || error.response?.status);
-      if (status === 429 && attempt < retries) {
-        const nextAttempt = attempt + 1;
+
+      if (status === 429) {
         const explicitDelayMs = getUpstreamRetryDelayMs(error);
-        const waitMs = computeBackoffMs(nextAttempt, explicitDelayMs);
-        logger.warn(
-          `${loggerPrefix}收到 429，等待 ${waitMs}ms 后进行第 ${nextAttempt} 次重试（共 ${retries} 次）` +
-          (explicitDelayMs !== null ? `（上游提示≈${explicitDelayMs}ms）` : '')
-        );
-        await sleep(waitMs);
-        attempt = nextAttempt;
-        continue;
+        const upstreamResetTimestamp = getUpstreamResetTimestamp(error);
+
+        // 检查是否是长时间冷却（额度耗尽）
+        if (explicitDelayMs !== null && explicitDelayMs >= cooldownThreshold && tokenId && modelId) {
+          // 恢复时间超过阈值，触发模型系列禁用
+          let finalResetTimestamp = upstreamResetTimestamp;
+
+          // 尝试从 quotas.json 获取更准确的恢复时间
+          const { resetTime: quotaResetTime, hasData } = quotaManager.getModelGroupResetTime(tokenId, modelId);
+
+          if (!hasData && typeof refreshQuota === 'function') {
+            // 没有额度数据，尝试刷新
+            logger.info(`${loggerPrefix}正在获取最新额度数据以确定准确恢复时间...`);
+            try {
+              await refreshQuota();
+              const refreshed = quotaManager.getModelGroupResetTime(tokenId, modelId);
+              if (refreshed.resetTime) {
+                finalResetTimestamp = refreshed.resetTime;
+              }
+            } catch (e) {
+              logger.warn(`${loggerPrefix}获取额度数据失败: ${e.message}`);
+            }
+          } else if (quotaResetTime) {
+            // 使用 quotas.json 中的恢复时间（通常更准确）
+            finalResetTimestamp = quotaResetTime;
+          }
+
+          if (finalResetTimestamp && finalResetTimestamp > Date.now()) {
+            const groupKey = tokenCooldownManager.getGroupKey(modelId);
+            const resetDate = new Date(finalResetTimestamp);
+            logger.warn(
+              `${loggerPrefix}收到 429，恢复时间 ${Math.round(explicitDelayMs / 1000 / 60)} 分钟后，` +
+              `超过阈值(${Math.round(cooldownThreshold / 1000 / 60)}分钟)，` +
+              `禁用 ${groupKey} 系列直到 ${resetDate.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`
+            );
+            tokenCooldownManager.setCooldown(tokenId, modelId, finalResetTimestamp);
+            // 不重试，直接抛出错误
+            throw error;
+          }
+        }
+
+        // 短时间等待，正常重试
+        if (attempt < retries) {
+          const nextAttempt = attempt + 1;
+          const waitMs = computeBackoffMs(nextAttempt, explicitDelayMs);
+          logger.warn(
+            `${loggerPrefix}收到 429，等待 ${waitMs}ms 后进行第 ${nextAttempt} 次重试（共 ${retries} 次）` +
+            (explicitDelayMs !== null ? `（上游提示≈${explicitDelayMs}ms）` : '')
+          );
+          await sleep(waitMs);
+          attempt = nextAttempt;
+          continue;
+        }
       }
       throw error;
     }

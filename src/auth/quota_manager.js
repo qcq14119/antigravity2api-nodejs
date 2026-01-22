@@ -295,6 +295,51 @@ class QuotaManager {
   }
 
   /**
+   * 获取模型系列的最早恢复时间
+   * @param {string} tokenId - Token ID
+   * @param {string} modelId - 模型 ID
+   * @returns {{resetTime: number|null, hasData: boolean}} resetTime 为时间戳（毫秒），hasData 表示是否有该系列的数据
+   */
+  getModelGroupResetTime(tokenId, modelId) {
+    const data = this.cache.get(tokenId);
+    if (!data || !data.models) {
+      return { resetTime: null, hasData: false };
+    }
+
+    const groupKey = this._getGroupKey(modelId);
+    let earliestReset = null;
+    let found = false;
+
+    for (const [id, quotaData] of Object.entries(data.models)) {
+      const idGroupKey = this._getGroupKey(id);
+      if (idGroupKey === groupKey) {
+        found = true;
+        const resetTimeRaw = quotaData.t;
+        if (resetTimeRaw) {
+          const resetMs = Date.parse(resetTimeRaw);
+          if (Number.isFinite(resetMs)) {
+            if (earliestReset === null || resetMs < earliestReset) {
+              earliestReset = resetMs;
+            }
+          }
+        }
+      }
+    }
+
+    return { resetTime: earliestReset, hasData: found };
+  }
+
+  /**
+   * 检查是否有指定 token 的额度数据
+   * @param {string} tokenId - Token ID
+   * @returns {boolean} 是否有数据
+   */
+  hasQuotaData(tokenId) {
+    const data = this.cache.get(tokenId);
+    return !!(data && data.models && Object.keys(data.models).length > 0);
+  }
+
+  /**
    * 计算预估剩余请求次数
    * @param {number} remainingFraction - 剩余额度比例 (0-1)
    * @param {number} requestCount - 已使用的请求次数

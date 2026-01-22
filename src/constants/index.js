@@ -96,6 +96,13 @@ export const DEFAULT_REQUEST_COUNT_PER_TOKEN = 50;
  */
 export const TOKEN_REFRESH_BUFFER = 300000;
 
+/**
+ * 长时间冷却阈值（毫秒）- 1小时
+ * 当 429 恢复时间超过此值时，触发模型系列级别的禁用
+ * @type {number}
+ */
+export const LONG_COOLDOWN_THRESHOLD = 60 * 60 * 1000;
+
 // ==================== 生成参数默认值 ====================
 
 /**

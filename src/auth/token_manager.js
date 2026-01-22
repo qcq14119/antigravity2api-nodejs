@@ -11,6 +11,7 @@ import {
 import TokenStore from './token_store.js';
 import { TokenError } from '../utils/errors.js';
 import quotaManager from './quota_manager.js';
+import tokenCooldownManager from './token_cooldown_manager.js';
 
 // 轮询策略枚举
 const RotationStrategy = {
@@ -661,20 +662,20 @@ class TokenManager {
   }
 
   /**
-   * 检查所有 token 对指定模型的额度是否都为 0
+   * 检查所有 token 对指定模型是否都不可用（额度为0或在冷却中）
    * @param {string} modelId - 模型 ID
-   * @returns {boolean} true = 所有 token 对该模型额度都为 0
+   * @returns {boolean} true = 所有 token 对该模型都不可用
    * @private
    */
   _checkAllTokensExhaustedForModel(modelId) {
     if (!modelId || this.tokens.length === 0) return false;
 
     for (const token of this.tokens) {
-      if (this._hasQuotaForModel(token, modelId)) {
-        return false; // 有至少一个 token 有额度
+      if (this._canUseTokenForModel(token, modelId)) {
+        return false; // 有至少一个 token 可用
       }
     }
-    return true; // 所有 token 都没有额度
+    return true; // 所有 token 都不可用
   }
 
   /**
@@ -697,6 +698,46 @@ class TokenManager {
       // 出错时假设有额度
       return true;
     }
+  }
+
+  /**
+   * 检查 token 对指定模型是否在冷却中
+   * @param {Object} token - Token 对象
+   * @param {string} modelId - 模型 ID
+   * @returns {boolean} true = 可用（不在冷却中），false = 在冷却中
+   * @private
+   */
+  _isTokenAvailableForModel(token, modelId) {
+    if (!token || !modelId) return true;
+
+    try {
+      const salt = this.store._salt;
+      if (!salt) return true;
+
+      const tokenId = generateTokenId(token.refresh_token, salt);
+      return tokenCooldownManager.isAvailable(tokenId, modelId);
+    } catch (error) {
+      return true;
+    }
+  }
+
+  /**
+   * 检查 token 对指定模型是否可用（既有额度，又不在冷却中）
+   * @param {Object} token - Token 对象
+   * @param {string} modelId - 模型 ID
+   * @returns {boolean} true = 可用，false = 不可用
+   * @private
+   */
+  _canUseTokenForModel(token, modelId) {
+    if (!token || !modelId) return true;
+
+    // 先检查冷却状态（更严格的限制）
+    if (!this._isTokenAvailableForModel(token, modelId)) {
+      return false;
+    }
+
+    // 再检查额度
+    return this._hasQuotaForModel(token, modelId);
   }
 
   /**
@@ -745,10 +786,10 @@ class TokenManager {
       const tokenIndex = this.availableQuotaTokenIndices[listIndex];
       const token = this.tokens[tokenIndex];
 
-      // 如果提供了 modelId 且不是所有 token 都耗尽，检查该 token 对该模型是否有额度
+      // 如果提供了 modelId 且不是所有 token 都耗尽，检查该 token 对该模型是否可用
       if (modelId && !allTokensExhausted) {
-        if (!this._hasQuotaForModel(token, modelId)) {
-          // 该 token 对该模型额度为 0，跳过
+        if (!this._canUseTokenForModel(token, modelId)) {
+          // 该 token 对该模型不可用（额度为 0 或在冷却中），跳过
           continue;
         }
       }
@@ -804,10 +845,10 @@ class TokenManager {
       const index = (startIndex + i) % totalTokens;
       const token = this.tokens[index];
 
-      // 如果提供了 modelId 且不是所有 token 都耗尽，检查该 token 对该模型是否有额度
+      // 如果提供了 modelId 且不是所有 token 都耗尽，检查该 token 对该模型是否可用
       if (modelId && !allTokensExhausted) {
-        if (!this._hasQuotaForModel(token, modelId)) {
-          // 该 token 对该模型额度为 0，跳过
+        if (!this._canUseTokenForModel(token, modelId)) {
+          // 该 token 对该模型不可用（额度为 0 或在冷却中），跳过
           continue;
         }
       }
@@ -1058,6 +1099,22 @@ class TokenManager {
    */
   async getSalt() {
     return this.store.getSalt();
+  }
+
+  /**
+   * 根据 token 对象获取 tokenId
+   * @param {Object} token - Token 对象
+   * @returns {string|null} tokenId，如果无法生成返回 null
+   */
+  getTokenId(token) {
+    if (!token?.refresh_token) return null;
+    try {
+      const salt = this.store._salt;
+      if (!salt) return null;
+      return generateTokenId(token.refresh_token, salt);
+    } catch (error) {
+      return null;
+    }
   }
 
   // 获取当前轮询配置

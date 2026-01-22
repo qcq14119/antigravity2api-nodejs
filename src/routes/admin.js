@@ -64,26 +64,7 @@ const cookieAuthMiddleware = (req, res, next) => {
   }
 };
 
-// 登录速率限制 - 防止暴力破解
-const loginAttempts = new Map(); // IP -> { count, lastAttempt, blockedUntil }
-const MAX_LOGIN_ATTEMPTS = 5;
-const BLOCK_DURATION = 5 * 60 * 1000; // 5分钟
-const ATTEMPT_WINDOW = 15 * 60 * 1000; // 15分钟窗口
-const LOGIN_CLEANUP_INTERVAL = 10 * 60 * 1000; // 10分钟清理一次
-
-// 定期清理过期的登录尝试记录（防止内存泄漏）
-const loginCleanupTimer = setInterval(() => {
-  const now = Date.now();
-  for (const [ip, attempt] of loginAttempts.entries()) {
-    // 如果最后尝试时间超过窗口期，且没有被封禁（或封禁已过期），删除记录
-    if (now - attempt.lastAttempt > ATTEMPT_WINDOW &&
-      (!attempt.blockedUntil || now > attempt.blockedUntil)) {
-      loginAttempts.delete(ip);
-    }
-  }
-}, LOGIN_CLEANUP_INTERVAL);
-loginCleanupTimer.unref(); // 不阻止进程退出
-
+// 获取客户端 IP
 function getClientIP(req) {
   return req.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
     req.headers['x-real-ip'] ||
@@ -92,65 +73,21 @@ function getClientIP(req) {
     'unknown';
 }
 
-function checkLoginRateLimit(ip) {
-  const now = Date.now();
-  const attempt = loginAttempts.get(ip);
-
-  if (!attempt) return { allowed: true };
-
-  // 检查是否被封禁
-  if (attempt.blockedUntil && now < attempt.blockedUntil) {
-    const remainingSeconds = Math.ceil((attempt.blockedUntil - now) / 1000);
-    return {
-      allowed: false,
-      message: `登录尝试过多，请 ${remainingSeconds} 秒后重试`,
-      remainingSeconds
-    };
-  }
-
-  // 清理过期的尝试记录
-  if (now - attempt.lastAttempt > ATTEMPT_WINDOW) {
-    loginAttempts.delete(ip);
-    return { allowed: true };
-  }
-
-  return { allowed: true };
-}
-
-function recordLoginAttempt(ip, success) {
-  const now = Date.now();
-
-  if (success) {
-    // 登录成功，清除记录
-    loginAttempts.delete(ip);
-    return;
-  }
-
-  // 登录失败，记录尝试
-  const attempt = loginAttempts.get(ip) || { count: 0, lastAttempt: now };
-  attempt.count++;
-  attempt.lastAttempt = now;
-
-  // 超过最大尝试次数，封禁
-  if (attempt.count >= MAX_LOGIN_ATTEMPTS) {
-    attempt.blockedUntil = now + BLOCK_DURATION;
-    logger.warn(`IP ${ip} 因登录失败次数过多被暂时封禁`);
-  }
-
-  loginAttempts.set(ip, attempt);
-}
-
 // 登录接口
-router.post('/login', (req, res) => {
+router.post('/login', async (req, res) => {
   const clientIP = getClientIP(req);
 
-  // 检查速率限制
-  const rateCheck = checkLoginRateLimit(clientIP);
-  if (!rateCheck.allowed) {
+  // 使用统一的 IP 封禁管理器检查
+  const blockStatus = ipBlockManager.check(clientIP);
+  if (blockStatus.blocked) {
+    if (blockStatus.reason === 'permanent') {
+      return res.status(403).json({ success: false, message: '您的IP已被永久封禁' });
+    }
+    const remainingMinutes = Math.ceil((blockStatus.expiresAt - Date.now()) / 60000);
     return res.status(429).json({
       success: false,
-      message: rateCheck.message,
-      retryAfter: rateCheck.remainingSeconds
+      message: `登录尝试过多，请 ${remainingMinutes} 分钟后重试`,
+      retryAfter: remainingMinutes * 60
     });
   }
 
@@ -167,7 +104,6 @@ router.post('/login', (req, res) => {
   }
 
   if (username === config.admin.username && password === config.admin.password) {
-    recordLoginAttempt(clientIP, true);
     const token = generateToken({ username, role: 'admin' });
 
     // 设置 HttpOnly Cookie
@@ -181,7 +117,8 @@ router.post('/login', (req, res) => {
     logger.info(`管理员登录成功 IP: ${clientIP}`);
     res.json({ success: true, token });
   } else {
-    recordLoginAttempt(clientIP, false);
+    // 使用统一的 IP 封禁管理器记录违规
+    await ipBlockManager.recordViolation(clientIP, 'admin_login_fail');
     logger.warn(`管理员登录失败 IP: ${clientIP}`);
     res.status(401).json({ success: false, message: '用户名或密码错误' });
   }
