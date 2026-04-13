@@ -115,17 +115,17 @@ router.get('/memory', (req, res) => res.json({ ram: { free: 8589934592, used: 85
 // POST 路由
 router.post('/img2img', async (req, res) => {
   const { prompt, init_images } = req.body;
-  
+
   try {
     if (!prompt) {
       return res.status(400).json({ error: 'prompt is required' });
     }
-    
-    const token = await tokenManager.getToken();
+
+    const token = await tokenManager.getNextToken();
     if (!token) {
       throw new Error('没有可用的token');
     }
-    
+
     // 构建包含图片的消息
     const content = [{ type: 'text', text: prompt }];
     if (init_images && init_images.length > 0) {
@@ -134,18 +134,18 @@ router.post('/img2img', async (req, res) => {
         content.push({ type: 'image_url', image_url: { url: `data:image/${format};base64,${img}` } });
       });
     }
-    
+
     const messages = [{ role: 'user', content }];
     const requestBody = prepareImageRequest(
       generateRequestBody(messages, 'gemini-3.1-flash-image', {}, null, token)
     );
-    
+
     const images = await generateImageForSD(requestBody, token);
-    
+
     if (images.length === 0) {
       throw new Error('未生成图片');
     }
-    
+
     res.json({
       images,
       parameters: req.body,
@@ -159,24 +159,24 @@ router.post('/img2img', async (req, res) => {
 
 router.post('/txt2img', async (req, res) => {
   const { prompt, negative_prompt, steps, cfg_scale, width, height, seed, sampler_name } = req.body;
-  
+
   try {
     if (!prompt) {
       return res.status(400).json({ error: 'prompt is required' });
     }
-    
-    const token = await tokenManager.getToken();
+
+    const token = await tokenManager.getNextToken();
     if (!token) {
       throw new Error('没有可用的token');
     }
-    
+
     const requestBody = buildImageRequestBody(prompt, token);
     const images = await generateImageForSD(requestBody, token);
-    
+
     if (images.length === 0) {
       throw new Error('未生成图片');
     }
-    
+
     res.json({
       images,
       parameters: { prompt, negative_prompt, steps, cfg_scale, width, height, seed, sampler_name },

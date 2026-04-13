@@ -130,7 +130,10 @@ export const handleGeminiRequest = async (req, res, modelName, isStream) => {
       onAttempt: () => tokenManager.recordRequest(token, modelName),
       tokenId,
       modelId: modelName,
-      refreshQuota
+      refreshQuota,
+      tokenManager,
+      token,
+      requestBody  // 传递 requestBody 用于积分注入
     });
 
     const isImageModel = modelName.includes('-image');
@@ -148,7 +151,12 @@ export const handleGeminiRequest = async (req, res, modelName, isStream) => {
         if (isImageModel) {
           // 生图模型：使用非流式获取结果后一次性返回
           const { content, usage, reasoningSignature } = await with429Retry(
-            () => generateAssistantResponseNoStream(requestBody, token),
+            (attempt, shouldUseCredits) => {
+              const actualRequestBody = shouldUseCredits 
+                ? { ...requestBody, enabledCreditTypes: ["GOOGLE_ONE_AI"] }
+                : requestBody;
+              return generateAssistantResponseNoStream(actualRequestBody, token);
+            },
             safeRetries,
             createRetryOptions('gemini.stream.image ')
           );
@@ -163,24 +171,29 @@ export const handleGeminiRequest = async (req, res, modelName, isStream) => {
         let hasToolCall = false;
 
         await with429Retry(
-          () => generateAssistantResponse(requestBody, token, (data) => {
-            if (data.type === 'usage') {
-              usageData = data.usage;
-            } else if (data.type === 'reasoning') {
-              // Gemini 思考内容
-              const chunk = createGeminiResponse(null, data.reasoning_content, data.thoughtSignature, null, null, null, { passSignatureToClient: config.passSignatureToClient });
-              writeStreamData(res, chunk);
-            } else if (data.type === 'tool_calls') {
-              hasToolCall = true;
-              // Gemini 工具调用
-              const chunk = createGeminiResponse(null, null, null, data.tool_calls, null, null, { passSignatureToClient: config.passSignatureToClient });
-              writeStreamData(res, chunk);
-            } else {
-              // 普通文本
-              const chunk = createGeminiResponse(data.content, null, null, null, null, null, { passSignatureToClient: config.passSignatureToClient });
-              writeStreamData(res, chunk);
-            }
-          }),
+          (attempt, shouldUseCredits) => {
+            const actualRequestBody = shouldUseCredits 
+              ? { ...requestBody, enabledCreditTypes: ["GOOGLE_ONE_AI"] }
+              : requestBody;
+            return generateAssistantResponse(actualRequestBody, token, (data) => {
+              if (data.type === 'usage') {
+                usageData = data.usage;
+              } else if (data.type === 'reasoning') {
+                // Gemini 思考内容
+                const chunk = createGeminiResponse(null, data.reasoning_content, data.thoughtSignature, null, null, null, { passSignatureToClient: config.passSignatureToClient });
+                writeStreamData(res, chunk);
+              } else if (data.type === 'tool_calls') {
+                hasToolCall = true;
+                // Gemini 工具调用
+                const chunk = createGeminiResponse(null, null, null, data.tool_calls, null, null, { passSignatureToClient: config.passSignatureToClient });
+                writeStreamData(res, chunk);
+              } else {
+                // 普通文本
+                const chunk = createGeminiResponse(data.content, null, null, null, null, null, { passSignatureToClient: config.passSignatureToClient });
+                writeStreamData(res, chunk);
+              }
+            });
+          },
           safeRetries,
           createRetryOptions('gemini.stream ')
         );
@@ -215,20 +228,25 @@ export const handleGeminiRequest = async (req, res, modelName, isStream) => {
 
       try {
         await with429Retry(
-          () => generateAssistantResponse(requestBody, token, (data) => {
-            if (data.type === 'usage') {
-              usageData = data.usage;
-            } else if (data.type === 'reasoning') {
-              reasoningContent += data.reasoning_content || '';
-              if (data.thoughtSignature) {
-                reasoningSignature = data.thoughtSignature;
+          (attempt, shouldUseCredits) => {
+            const actualRequestBody = shouldUseCredits 
+              ? { ...requestBody, enabledCreditTypes: ["GOOGLE_ONE_AI"] }
+              : requestBody;
+            return generateAssistantResponse(actualRequestBody, token, (data) => {
+              if (data.type === 'usage') {
+                usageData = data.usage;
+              } else if (data.type === 'reasoning') {
+                reasoningContent += data.reasoning_content || '';
+                if (data.thoughtSignature) {
+                  reasoningSignature = data.thoughtSignature;
+                }
+              } else if (data.type === 'tool_calls') {
+                toolCalls.push(...data.tool_calls);
+              } else if (data.type === 'text') {
+                content += data.content || '';
               }
-            } else if (data.type === 'tool_calls') {
-              toolCalls.push(...data.tool_calls);
-            } else if (data.type === 'text') {
-              content += data.content || '';
-            }
-          }),
+            });
+          },
           safeRetries,
           createRetryOptions('gemini.fake_no_stream ')
         );
@@ -248,7 +266,12 @@ export const handleGeminiRequest = async (req, res, modelName, isStream) => {
       res.setTimeout(0);
 
       const { content, reasoningContent, reasoningSignature, toolCalls, usage } = await with429Retry(
-        () => generateAssistantResponseNoStream(requestBody, token),
+        (attempt, shouldUseCredits) => {
+          const actualRequestBody = shouldUseCredits 
+            ? { ...requestBody, enabledCreditTypes: ["GOOGLE_ONE_AI"] }
+            : requestBody;
+          return generateAssistantResponseNoStream(actualRequestBody, token);
+        },
         safeRetries,
         createRetryOptions('gemini.no_stream ')
       );

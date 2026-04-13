@@ -6,10 +6,11 @@
 import config from '../config/config.js';
 import logger from '../utils/logger.js';
 import memoryManager, { registerMemoryPoolCleanup } from '../utils/memoryManager.js';
-import { DEFAULT_HEARTBEAT_INTERVAL, LONG_COOLDOWN_THRESHOLD } from '../constants/index.js';
+import { DEFAULT_HEARTBEAT_INTERVAL, LONG_COOLDOWN_THRESHOLD, SHORT_COOLDOWN_THRESHOLD } from '../constants/index.js';
 import tokenCooldownManager from '../auth/token_cooldown_manager.js';
 import quotaManager from '../auth/quota_manager.js';
 import { getGroupKey } from '../utils/modelGroups.js';
+import { hasOtherAvailableModelGroups, getAvailableModelGroups } from '../utils/tokenQuotaHelper.js';
 
 // ==================== 心跳机制（防止 CF 超时） ====================
 const HEARTBEAT_INTERVAL = config.server.heartbeatInterval || DEFAULT_HEARTBEAT_INTERVAL;
@@ -301,7 +302,7 @@ function isRetryableError(status, error) {
 
 /**
  * 带 429/503 重试的执行器
- * @param {Function} fn - 要执行的异步函数，接收 attempt 参数
+ * @param {Function} fn - 要执行的异步函数，接收 attempt 和 shouldUseCredits 参数
  * @param {number} maxRetries - 最大重试次数
  * @param {Object} options - 可选参数
  * @param {string} options.loggerPrefix - 日志前缀
@@ -309,6 +310,8 @@ function isRetryableError(status, error) {
  * @param {string} options.tokenId - Token ID（用于模型系列禁用）
  * @param {string} options.modelId - 模型 ID（用于模型系列禁用）
  * @param {Function} options.refreshQuota - 刷新额度的回调函数（当需要获取准确恢复时间时调用）
+ * @param {Object} options.tokenManager - TokenManager 实例
+ * @param {Object} options.token - Token 对象
  * @returns {Promise<any>}
  */
 export async function with429Retry(fn, maxRetries, options = {}, legacyOnAttempt = null) {
@@ -318,6 +321,8 @@ export async function with429Retry(fn, maxRetries, options = {}, legacyOnAttempt
   let tokenId = null;
   let modelId = null;
   let refreshQuota = null;
+  let tokenManager = null;
+  let token = null;
 
   if (typeof options === 'string') {
     // 旧版调用方式
@@ -329,11 +334,15 @@ export async function with429Retry(fn, maxRetries, options = {}, legacyOnAttempt
     tokenId = options.tokenId || null;
     modelId = options.modelId || null;
     refreshQuota = options.refreshQuota || null;
+    tokenManager = options.tokenManager || null;
+    token = options.token || null;
   }
 
   const retries = Number.isFinite(maxRetries) && maxRetries > 0 ? Math.floor(maxRetries) : 0;
-  const cooldownThreshold = config.quota?.longCooldownThreshold || LONG_COOLDOWN_THRESHOLD;
+  const longCooldownThreshold = config.quota?.longCooldownThreshold || LONG_COOLDOWN_THRESHOLD;
+  const shortCooldownThreshold = config.quota?.shortCooldownThreshold || SHORT_COOLDOWN_THRESHOLD;
   let attempt = 0;
+  let shouldUseCredits = false; // 标记是否应该使用积分
 
   // 首次执行 + 最多 retries 次重试
   while (true) {
@@ -342,7 +351,10 @@ export async function with429Retry(fn, maxRetries, options = {}, legacyOnAttempt
       if (typeof onAttempt === 'function') {
         onAttempt(attempt);
       }
-      return await fn(attempt);
+      
+      // 将 shouldUseCredits 参数传递给回调函数
+      // 回调函数负责根据此参数动态生成 requestBody
+      return await fn(attempt, shouldUseCredits);
     } catch (error) {
       // 兼容多种错误格式：error.status, error.statusCode, error.response?.status
       const status = Number(error.status || error.statusCode || error.response?.status);
@@ -352,11 +364,10 @@ export async function with429Retry(fn, maxRetries, options = {}, legacyOnAttempt
         const upstreamResetTimestamp = getUpstreamResetTimestamp(error);
         const errorType = status === 503 ? '503 (容量不足)' : '429';
 
-        // 检查是否是长时间冷却（额度耗尽）- 仅 429 触发模型系列禁用
-        if (status === 429 && explicitDelayMs !== null && explicitDelayMs >= cooldownThreshold && tokenId && modelId) {
-          // 先检查是否已经被其他并发请求禁用了，避免重复处理
+        // ===== 档位3：长冷却（≥1h）- 仅 429 触发模型系列禁用 =====
+        if (status === 429 && explicitDelayMs !== null && explicitDelayMs >= longCooldownThreshold && tokenId && modelId) {
+          // 幂等：已经被其他并发请求禁用了，直接抛出
           if (!tokenCooldownManager.isAvailable(tokenId, modelId)) {
-            // 已经在冷却中，直接抛出错误，不重复处理
             throw error;
           }
 
@@ -387,24 +398,87 @@ export async function with429Retry(fn, maxRetries, options = {}, legacyOnAttempt
             const groupKey = getGroupKey(modelId);
             const resetDate = new Date(finalResetTimestamp);
             const delayMinutes = Math.round((finalResetTimestamp - Date.now()) / 1000 / 60);
-          logger.warn(
-            `${loggerPrefix}收到 ${errorType}，恢复时间 ${delayMinutes} 分钟后，` +
-              `超过阈值(${Math.round(cooldownThreshold / 1000 / 60)}分钟)，` +
+            
+            logger.warn(
+              `${loggerPrefix}[长冷却] 收到 ${errorType}，恢复时间 ${delayMinutes} 分钟后，` +
+              `超过阈值(${Math.round(longCooldownThreshold / 1000 / 60)}分钟)，` +
               `禁用 ${groupKey} 系列直到 ${resetDate.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}`
             );
+            
+            // 1. 设置模型组级冷却
             tokenCooldownManager.setCooldown(tokenId, modelId, finalResetTimestamp);
-            // 不重试，直接抛出错误
+            
+            // 2. 检查是否所有模型组都被禁用（新增）
+            const hasOtherModels = hasOtherAvailableModelGroups(tokenId);
+            
+            if (!hasOtherModels) {
+              // 3. 所有模型组都不可用，标记整个 token 配额耗尽（新增）
+              logger.warn(
+                `${loggerPrefix}Token ${tokenId} 的所有核心模型组都已禁用，标记为配额耗尽`
+              );
+              
+              // 获取 token 对象并标记配额耗尽
+              if (tokenManager && token) {
+                try {
+                  await tokenManager.markTokenQuotaExhausted(token);
+                } catch (e) {
+                  logger.error(`${loggerPrefix}标记 token 配额耗尽失败: ${e.message}`);
+                }
+              }
+            } else {
+              // 4. 还有其他可用模型组，记录信息（新增）
+              const availableGroups = getAvailableModelGroups(tokenId);
+              logger.info(
+                `${loggerPrefix}Token ${tokenId} 仍有其他可用模型组: ${availableGroups.join(', ')}`
+              );
+            }
+            
+            // 长冷却不重试，直接抛出错误
             throw error;
           }
         }
 
-        // 短时间等待，正常重试
+        // ===== 档位2：短冷却（3s ≤ delay < 1h）- 冻结当前 token+model，终止重试让上层换 token =====
+        if (status === 429 && explicitDelayMs !== null && explicitDelayMs >= shortCooldownThreshold && tokenId && modelId) {
+          // 幂等：已经在冷却中，直接抛出
+          if (!tokenCooldownManager.isAvailable(tokenId, modelId)) {
+            throw error;
+          }
+          const cooldownUntil = upstreamResetTimestamp || (Date.now() + explicitDelayMs);
+          const groupKey = getGroupKey(modelId);
+          tokenCooldownManager.setCooldown(tokenId, modelId, cooldownUntil);
+          logger.warn(
+            `${loggerPrefix}[短冷却] 收到 429，延迟 ${Math.round(explicitDelayMs / 1000)}s，` +
+            `已冻结 token ${tokenId} 的 ${groupKey} 系列至 ` +
+            `${new Date(cooldownUntil).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}，` +
+            `终止当前重试（上层将换 token）`
+          );
+          // 不在本次请求内重试，让上层 tokenManager 下次选另一个 token
+          throw error;
+        }
+
+        // ===== 档位1：瞬时重试（< 3s 或无明确延迟）=====
         if (attempt < retries) {
           const nextAttempt = attempt + 1;
-          const waitMs = computeBackoffMs(nextAttempt, explicitDelayMs);
+          
+          // 首次 429 且未开启 alwaysUseCredits，先尝试使用积分重试
+          if (attempt === 0 && !config.alwaysUseCredits && !shouldUseCredits) {
+            shouldUseCredits = true;
+            logger.warn(
+              `${loggerPrefix}[瞬时重试] 收到 ${errorType}，尝试使用 Google One AI 积分进行重试`
+            );
+            // 不增加 attempt 计数，直接重试
+            continue;
+          }
+          
+          // 瞬时重试：有明确短延迟时精确等待，否则走指数退避
+          const waitMs = (explicitDelayMs !== null && explicitDelayMs < shortCooldownThreshold)
+            ? Math.max(0, Math.floor(explicitDelayMs + 50))
+            : computeBackoffMs(nextAttempt, explicitDelayMs);
           logger.warn(
-            `${loggerPrefix}收到 ${errorType}，等待 ${waitMs}ms 后进行第 ${nextAttempt} 次重试（共 ${retries} 次）` +
-            (explicitDelayMs !== null ? `（上游提示≈${explicitDelayMs}ms）` : '')
+            `${loggerPrefix}[瞬时重试] 收到 ${errorType}，等待 ${waitMs}ms 后进行第 ${nextAttempt} 次重试（共 ${retries} 次）` +
+            (explicitDelayMs !== null ? `（上游提示≈${explicitDelayMs}ms）` : '') +
+            (shouldUseCredits ? '（使用积分）' : '')
           );
           await sleep(waitMs);
           attempt = nextAttempt;

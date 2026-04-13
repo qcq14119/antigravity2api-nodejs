@@ -1,51 +1,8 @@
-import axios from 'axios';
 import crypto from 'crypto';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import log from '../utils/logger.js';
-import config from '../config/config.js';
-import tokenManager from './token_manager.js';
+import requesterManager from '../utils/requesterManager.js';
+import ProjectIdFetcher from './project_id_fetcher.js';
 import { OAUTH_CONFIG, OAUTH_SCOPES, GEMINICLI_OAUTH_CONFIG, GEMINICLI_OAUTH_SCOPES } from '../constants/oauth.js';
-import { buildAxiosRequestConfig } from '../utils/httpClient.js';
-import fingerprintRequester from '../requester.js';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// 请求客户端：优先使用 FingerprintRequester，失败则自动降级到 axios
-let requester = null;
-let useAxios = false;
-
-if (config.useNativeAxios === true) {
-	useAxios = true;
-} else {
-	try {
-		const isPkg = typeof process.pkg !== 'undefined';
-		const configPath = isPkg
-			? path.join(path.dirname(process.execPath), 'bin', 'tls_config.json')
-			: path.join(__dirname, '..', 'bin', 'tls_config.json');
-		requester = fingerprintRequester.create({
-			configPath,
-			timeout: config.timeout ? Math.ceil(config.timeout / 1000) : 30,
-			proxy: config.proxy || null,
-		});
-	} catch (error) {
-		log.warn('[OAuthManager] FingerprintRequester 初始化失败，自动降级使用 axios:', error.message);
-		useAxios = true;
-	}
-}
-
-function buildRequesterConfig(headers, body = null, method = 'POST') {
-	const reqConfig = {
-		method,
-		headers,
-		timeout_ms: config.timeout,
-		proxy: config.proxy
-	};
-	if (body !== null) {
-		reqConfig.body = typeof body === 'string' ? body : JSON.stringify(body);
-	}
-	return reqConfig;
-}
 
 class OAuthManager {
 	constructor() {
@@ -97,23 +54,16 @@ class OAuthManager {
 			'Accept-Encoding': 'gzip'
 		};
 
-		if (useAxios) {
-			const response = await axios(buildAxiosRequestConfig({
+		try {
+			const { data } = await requesterManager.fetch(oauthConfig.TOKEN_URL, {
 				method: 'POST',
-				url: oauthConfig.TOKEN_URL,
 				headers,
-				data: postData.toString(),
-				timeout: config.timeout
-			}));
-			return response.data;
+				body: postData.toString(),
+			});
+			return data;
+		} catch (error) {
+			throw new Error(`Token交换请求失败 (${error.status ?? ''}): ${error.message}`);
 		}
-
-		const response = await requester.antigravity_fetch(oauthConfig.TOKEN_URL, buildRequesterConfig(headers, postData.toString()));
-		if (response.status !== 200) {
-			const errorBody = await response.text();
-			throw new Error(`Token交换请求失败 (${response.status}): ${errorBody}`);
-		}
-		return await response.json();
 	}
 
 	/**
@@ -128,22 +78,10 @@ class OAuthManager {
 		};
 
 		try {
-			if (useAxios) {
-				const response = await axios(buildAxiosRequestConfig({
-					method: 'GET',
-					url: 'https://www.googleapis.com/oauth2/v2/userinfo',
-					headers,
-					timeout: config.timeout
-				}));
-				return response.data?.email;
-			}
-
-			const response = await requester.antigravity_fetch('https://www.googleapis.com/oauth2/v2/userinfo', buildRequesterConfig(headers, null, 'GET'));
-			if (response.status !== 200) {
-				const errorBody = await response.text();
-				throw new Error(`获取用户信息失败 (${response.status}): ${errorBody}`);
-			}
-			const data = await response.json();
+			const { data } = await requesterManager.fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
+				method: 'GET',
+				headers,
+			});
 			return data?.email;
 		} catch (err) {
 			log.warn('获取用户邮箱失败:', err.message);
@@ -152,25 +90,13 @@ class OAuthManager {
 	}
 
 	/**
-	 * 资格校验：尝试获取projectId
+	 * 使用 ProjectIdFetcher 的新方法进行完整验证
+	 * @param {string} accessToken - 访问令牌
+	 * @returns {Promise<{projectId: string|null, sub: string, hasQuota: boolean, source: string, isActivated: boolean, credits: number|null}>}
 	 */
-	async validateAndGetProjectId(accessToken) {
-		try {
-			log.info('正在验证账号资格...');
-			const {projectId,sub} = await tokenManager.fetchProjectId({ access_token: accessToken }) || {};
-
-			if (projectId === undefined || projectId === null) {
-				log.warn('该账号无法获取 projectId，可能无资格或需要稍后重试');
-				return { projectId: null, hasQuota: false, sub };
-			}
-
-			log.info('账号验证通过，projectId: ' + projectId);
-			return { projectId, hasQuota: true, sub };
-		} catch (err) {
-			log.error('验证账号资格失败: ' + err.message);
-			sub = "free-tier";
-			return { projectId: null, hasQuota: false,sub };
-		}
+	async validateAccount(accessToken) {
+		const fetcher = new ProjectIdFetcher();
+		return await fetcher.validateAccount({ access_token: accessToken });
 	}
 
 	/**
@@ -201,12 +127,22 @@ class OAuthManager {
 			log.info(`[${mode}] 获取到用户邮箱: ${email}`);
 		}
 
-		// 3. 资格校验（仅 antigravity 模式需要 projectId）
+		// 3. 资格校验（仅 antigravity 模式需要）
 		if (mode === 'antigravity') {
-			const { projectId, hasQuota,sub } = await this.validateAndGetProjectId(account.access_token);
-			account.projectId = projectId;
-			account.hasQuota = hasQuota;
-			account.sub = sub;
+			const validation = await this.validateAccount(account.access_token);
+			
+			account.projectId = validation.projectId;
+			account.sub = validation.sub;
+			account.hasQuota = validation.hasQuota;
+			account.isActivated = validation.isActivated;
+			
+			// 保存积分信息（仅 free-tier 以上订阅才有）
+			if (validation.credits !== null && validation.credits !== undefined) {
+				account.credits = validation.credits;
+				log.info(`[${mode}] 账号验证完成: sub=${validation.sub}, source=${validation.source}, credits=${validation.credits}`);
+			} else {
+				log.info(`[${mode}] 账号验证完成: sub=${validation.sub}, source=${validation.source}`);
+			}
 		}
 
 		account.enable = true;

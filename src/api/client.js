@@ -1,11 +1,10 @@
 import { randomUUID } from 'crypto';
 import tokenManager from '../auth/token_manager.js';
 import config from '../config/config.js';
-import fingerprintRequester from '../requester.js';
 import { saveBase64Image } from '../utils/imageStorage.js';
 import logger from '../utils/logger.js';
 import memoryManager from '../utils/memoryManager.js';
-import { httpRequest, httpStreamRequest } from '../utils/httpClient.js';
+import requesterManager from '../utils/requesterManager.js';
 import { generateTrajectorybody } from '../utils/trajectory.js';
 import { buildRecordCodeAssistMetricsBody } from '../utils/recordCodeAssistMetrics.js';
 import { createTelemetryBatch, serializeTelemetryBatch } from "../utils/createTelemetry.js"
@@ -14,8 +13,7 @@ import { buildClientRegister, buildFrontEnd, buildClientFeatrueHeaders, buildCli
 import { MODEL_LIST_CACHE_TTL, QA_PAIRS } from '../constants/index.js';
 import { createApiError } from '../utils/errors.js';
 import { generateCheckpointBody } from '../utils/checkPoint.js';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import axios from 'axios';
 import {
   convertToToolCall,
   registerStreamMemoryCleanup
@@ -32,11 +30,8 @@ import {
 } from './debugDump.js';
 import { getUpstreamStatus, readUpstreamErrorBody, isCallerDoesNotHavePermission } from './upstreamError.js';
 import { createStreamLineProcessor } from './streamLineProcessor.js';
-import { runAxiosSseStream, runNativeSseStream, postJsonAndParse } from './geminiTransport.js';
+import { runSseStream, postJsonAndParse } from './geminiTransport.js';
 import { parseGeminiCandidateParts, toOpenAIUsage } from './geminiResponseParser.js';
-import axios from 'axios';
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // ==================== Token 计时器管理 ====================
 const tokenTimers = new Map(); // { tokenKey: { lastUsed: timestamp, intervalId: intervalId } }
@@ -80,38 +75,6 @@ function checkTokenTimeout() {
 }
 
 setInterval(checkTokenTimeout, 30 * 1000); // 每30秒检查一次超时
-
-// 请求客户端：优先使用 FingerprintRequester，失败则自动降级到 axios
-let requester = null;
-let useAxios = false;
-
-// 初始化请求客户端
-if (config.useNativeAxios === true) {
-  useAxios = true;
-  logger.info('使用原生 axios 请求');
-} else {
-  try {
-    // 使用 src/bin/config.json 作为 TLS 指纹配置文件
-    // 检测是否在 pkg 环境中
-    const isPkg = typeof process.pkg !== 'undefined';
-
-    // 根据环境选择配置文件路径
-    const configPath = isPkg
-      ? path.join(path.dirname(process.execPath), 'bin', 'tls_config.json')  // pkg 打包环境
-      : path.join(__dirname, '..', 'bin', 'tls_config.json');  // 开发环境
-    requester = fingerprintRequester.create({
-      configPath,
-      timeout: config.timeout ? Math.ceil(config.timeout / 1000) : 30,
-      proxy: config.proxy || null,
-    });
-    logger.info('使用 FingerprintRequester 请求');
-  } catch (error) {
-    logger.warn('FingerprintRequester 初始化失败，自动降级使用 axios:', error.message);
-    useAxios = true;
-  }
-}
-
-// ==================== 调试：最终请求/原始响应完整输出（单文件追加模式） ====================
 
 // ==================== 模型列表缓存（智能管理） ====================
 const getModelCacheTTL = () => {
@@ -163,7 +126,7 @@ function registerMemoryCleanup() {
   // 由流式解析模块管理自身对象池大小
   registerStreamMemoryCleanup();
 
-  // 统一由内存清理器定时触发：仅清理“已过期”的模型列表缓存
+  // 统一由内存清理器定时触发：仅清理"已过期"的模型列表缓存
   memoryManager.registerCleanup(() => {
     const ttl = getModelCacheTTL();
     const now = Date.now();
@@ -179,34 +142,78 @@ registerMemoryCleanup();
 
 // ==================== 辅助函数 ====================
 
-function buildHeaders(token) {
+function buildHeaders(token, hostOverride = null) {
   return {
-    'Host': config.api.host,
+    'Host': hostOverride || config.api.host,
     'User-Agent': config.api.userAgent,
+    'Transfer-Encoding': 'chunked',
     'Authorization': `Bearer ${token.access_token}`,
     'Content-Type': 'application/json',
     'Accept-Encoding': 'gzip'
   };
 }
 
-function buildRequesterConfig(headers, body = null, method = "POST") {
-  const reqConfig = {
-    method: method,
-    headers,
-    timeout_ms: config.timeout,
-    proxy: config.proxy
-  };
-  if (body !== null) {
-    // 判断是否为二进制数据
-    if (Buffer.isBuffer(body) || body instanceof Uint8Array) {
-      reqConfig.body = body;  // 直接传递
-    } else {
-      reqConfig.body = JSON.stringify(body);  // JSON 对象才序列化
-    }
-  }
-  return reqConfig;
+// ==================== 上游 baseURL Fallback ====================
+
+/**
+ * 判断错误是否应触发 baseURL fallback
+ * 429 不触发（交给 with429Retry 的三档处理）
+ * 403/400 不触发（权限/请求错误，换 URL 没用）
+ */
+function shouldFallback(error) {
+  // 如果已经向客户端发送过流数据，禁止 fallback（避免脏数据）
+  if (error?._skipFallback) return false;
+  const status = getUpstreamStatus(error);
+  if (status === 429) return false;
+  if (status === 403) return false;
+  if (status === 400) return false;
+  if (status === 503) return true;
+  if (status >= 500) return true;
+  // 网络错误/超时（无 status 或 fallback 默认 500）
+  const code = error?.code || error?.cause?.code;
+  const networkCodes = [
+    'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND',
+    'EAI_AGAIN', 'EPIPE', 'UND_ERR_CONNECT_TIMEOUT', 'ERR_SOCKET_CONNECTION_TIMEOUT'
+  ];
+  if (code && networkCodes.includes(code)) return true;
+  if (error?.message?.includes('timeout')) return true;
+  return false;
 }
 
+/**
+ * 带上游 baseURL fallback 的执行器
+ * 按 config.api.upstreamCandidates 顺序尝试，遇到 503/网络错误/5xx 时自动切换下一个
+ * 429/403/400 等不 fallback，直接抛出让上层处理
+ *
+ * @param {Function} fn - (candidate) => Promise，candidate 包含 { name, url, noStreamUrl, host, ... }
+ *                        candidate 为 null 时表示无候选列表，应使用默认 config
+ * @returns {Promise<any>}
+ */
+async function withUpstreamFallback(fn) {
+  const candidates = config.api.upstreamCandidates;
+  if (!candidates || candidates.length === 0) {
+    // 无候选列表，直接用默认配置执行
+    return fn(null);
+  }
+  let lastError = null;
+  for (const candidate of candidates) {
+    try {
+      return await fn(candidate);
+    } catch (error) {
+      lastError = error;
+      if (!shouldFallback(error)) {
+        throw error; // 429/403/400 等不应 fallback 的错误直接抛出
+      }
+      const status = getUpstreamStatus(error);
+      logger.warn(
+        `[upstream-fallback] ${candidate.name} 失败 (${status || 'network error'}: ${error.message?.substring(0, 100)})，` +
+        `尝试下一个上游...`
+      );
+    }
+  }
+  logger.error('[upstream-fallback] 所有上游均失败');
+  throw lastError;
+}
 
 // 统一错误处理
 async function handleApiError(error, token, dumpId = null) {
@@ -221,7 +228,7 @@ async function handleApiError(error, token, dumpId = null) {
     if (isCallerDoesNotHavePermission(errorBody)) {
       throw createApiError(`超出模型最大上下文。错误详情: ${errorBody}`, status, errorBody);
     }
-    tokenManager.disableCurrentToken(token);
+    tokenManager.disableToken(token);
     throw createApiError(`该账号没有使用权限，已自动禁用。错误详情: ${errorBody}`, status, errorBody);
   }
 
@@ -237,56 +244,68 @@ export async function generateAssistantResponse(requestBody, token, callback) {
   const conversationId = randomUUID();
   const messageId = randomUUID();
   const modelName = requestBody.model;
-  const headers = buildHeaders(token);
   const dumpId = isDebugDumpEnabled() ? createDumpId('stream') : null;
   const streamCollector = dumpId ? createStreamCollector() : null;
-  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody)));
   let num = Math.floor(Math.random() * QA_PAIRS.length);
   if (dumpId) {
     await dumpFinalRequest(dumpId, requestBody);
   }
-
-  // 在 state 中临时缓存思维链签名，供流式多片段复用，并携带 session 与 model 信息以写入全局缓存
-  const state = {
-    toolCalls: [],
-    reasoningSignature: null,
-    sessionId: requestBody.request?.sessionId,
-    model: requestBody.model
-  };
-  const processor = createStreamLineProcessor({
-    state,
-    onEvent: callback,
-    onRawChunk: (chunk) => collectStreamChunk(streamCollector, chunk)
-  });
+  //console.log(JSON.stringify(requestBody,null,2));
 
   try {
-    if (useAxios) {
-      await runAxiosSseStream({
-        url: config.api.url,
-        headers,
-        data: requestBody,
-        timeout: config.timeout,
-        processor
+    // 追踪是否已经向客户端发送过流数据（用于防止 fallback 时产生脏数据）
+    let hasEmittedData = false;
+    const safeCallback = (...args) => {
+      hasEmittedData = true;
+      return callback(...args);
+    };
+
+    await withUpstreamFallback(async (candidate) => {
+      const targetUrl = candidate?.url || config.api.url;
+      const targetHost = candidate?.host || config.api.host;
+      const headers = buildHeaders(token, targetHost);
+      headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody)));
+
+      // 每次 fallback 尝试都创建新的 state/processor（避免上一次尝试的脏状态）
+      const state = {
+        toolCalls: [],
+        reasoningSignature: null,
+        sessionId: requestBody.request?.sessionId,
+        model: requestBody.model
+      };
+      const processor = createStreamLineProcessor({
+        state,
+        onEvent: safeCallback,
+        onRawChunk: (chunk) => collectStreamChunk(streamCollector, chunk)
       });
-    } else {
-      const streamResponse = requester.antigravity_fetchStream(config.api.url, buildRequesterConfig(headers, requestBody));
-      await runNativeSseStream({
-        streamResponse,
-        processor,
-        onErrorChunk: (chunk) => collectStreamChunk(streamCollector, chunk)
-      });
-    }
+
+      try {
+        await runSseStream({
+          url: targetUrl,
+          headers,
+          body: requestBody,
+          processor,
+          onErrorChunk: (chunk) => collectStreamChunk(streamCollector, chunk)
+        });
+      } catch (error) {
+        try { processor.close(); } catch { }
+        // 如果已经向客户端发送过数据，不能 fallback（否则客户端收到重复/混乱的流事件）
+        if (hasEmittedData) {
+          error._skipFallback = true;
+        }
+        throw error; // 让 withUpstreamFallback 判断是否 fallback
+      }
+    });
 
     // 流式响应结束后，以 JSON 格式写入日志
     if (dumpId) {
       await dumpStreamResponse(dumpId, streamCollector);
     }
     sendRecordCodeAssistMetrics(token, trajectoryId).catch(err => logger.warn('发送RecordCodeAssistMetrics失败:', err.message));
-    sendRecordTrajectoryAnalytics(token, num, trajectoryId,messageId,conversationId, modelName).catch(err => logger.warn('发送轨迹分析失败:', err.message));
-    sendLog(token,num,trajectoryId,conversationId,messageId).catch(err => logger.warn('发送log失败:', err.message));
+    sendRecordTrajectoryAnalytics(token, num, trajectoryId, messageId, conversationId, modelName).catch(err => logger.warn('发送轨迹分析失败:', err.message));
+    sendLog(token, num, trajectoryId, conversationId, messageId).catch(err => logger.warn('发送log失败:', err.message));
     sendCheckPoint(token).catch(err => logger.warn('发送checkPoint失败:', err.message));;
   } catch (error) {
-    try { processor.close(); } catch { }
     await handleApiError(error, token, dumpId);
   }
 }
@@ -294,21 +313,12 @@ export async function generateAssistantResponse(requestBody, token, callback) {
 // 内部工具：从远端拉取完整模型原始数据
 async function fetchRawModels(headers, token) {
   try {
-    if (useAxios) {
-      const response = await httpRequest({
-        method: 'POST',
-        url: config.api.modelsUrl,
-        headers,
-        data: {}
-      });
-      return response.data;
-    }
-    const response = await requester.antigravity_fetch(config.api.modelsUrl, buildRequesterConfig(headers, {}));
-    if (response.status !== 200) {
-      const errorBody = await response.text();
-      throw { status: response.status, message: errorBody };
-    }
-    return await response.json();
+    const { data } = await requesterManager.fetch(config.api.modelsUrl, {
+      method: 'POST',
+      headers,
+      body: {},
+    });
+    return data;
   } catch (error) {
     await handleApiError(error, token);
   }
@@ -402,29 +412,30 @@ export async function generateAssistantResponseNoStream(requestBody, token) {
   const conversationId = randomUUID();
   const messageId = randomUUID();
   const modelName = requestBody.model;
-  const headers = buildHeaders(token);
   const dumpId = isDebugDumpEnabled() ? createDumpId('no_stream') : null;
   let num = Math.floor(Math.random() * QA_PAIRS.length);
-  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody)));
 
   if (dumpId) await dumpFinalRequest(dumpId, requestBody);
   let data;
   try {
-    data = await postJsonAndParse({
-      useAxios,
-      requester,
-      url: config.api.noStreamUrl,
-      headers,
-      body: requestBody,
-      timeout: config.timeout,
-      requesterConfig: buildRequesterConfig(headers, requestBody),
-      dumpId,
-      dumpFinalRawResponse,
-      rawFormat: 'json'
+    data = await withUpstreamFallback(async (candidate) => {
+      const targetUrl = candidate?.noStreamUrl || config.api.noStreamUrl;
+      const targetHost = candidate?.host || config.api.host;
+      const headers = buildHeaders(token, targetHost);
+      headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody)));
+
+      return postJsonAndParse({
+        url: targetUrl,
+        headers,
+        body: requestBody,
+        dumpId,
+        dumpFinalRawResponse,
+        rawFormat: 'json'
+      });
     });
     sendRecordCodeAssistMetrics(token, trajectoryId).catch(err => logger.warn('发送RecordCodeAssistMetrics失败:', err.message));
-    sendRecordTrajectoryAnalytics(token, num, trajectoryId,messageId,conversationId, modelName).catch(err => logger.warn('发送轨迹分析失败:', err.message));
-    sendLog(token,num,trajectoryId,conversationId,messageId).catch(err => logger.warn('发送log失败:', err.message));
+    sendRecordTrajectoryAnalytics(token, num, trajectoryId, messageId, conversationId, modelName).catch(err => logger.warn('发送轨迹分析失败:', err.message));
+    sendLog(token, num, trajectoryId, conversationId, messageId).catch(err => logger.warn('发送log失败:', err.message));
   } catch (error) {
     await handleApiError(error, token, dumpId);
   }
@@ -485,34 +496,25 @@ export async function generateImageForSD(requestBody, token) {
   const messageId = randomUUID();
   const modelName = requestBody.model;
   const headers = buildHeaders(token);
-  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody),'utf-8'));
-  let data;
+  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody), 'utf-8'));
   let num = Math.floor(Math.random() * QA_PAIRS.length);
 
   //console.log(JSON.stringify(requestBody,null,2));
 
+  let data;
   try {
-    if (useAxios) {
-      data = (await httpRequest({
-        method: 'POST',
-        url: config.api.noStreamUrl,
-        headers,
-        data: requestBody
-      })).data;
-    } else {
-      const response = await requester.antigravity_fetch(config.api.noStreamUrl, buildRequesterConfig(headers, requestBody));
-      if (response.status !== 200) {
-        const errorBody = await response.text();
-        throw { status: response.status, message: errorBody };
-      }
-      data = await response.json();
-    }
+    const result = await requesterManager.fetch(config.api.noStreamUrl, {
+      method: 'POST',
+      headers,
+      body: requestBody,
+    });
+    data = result.data;
   } catch (error) {
     await handleApiError(error, token);
   }
   sendRecordCodeAssistMetrics(token, trajectoryId).catch(err => logger.warn('发送RecordCodeAssistMetrics失败:', err.message));
-  sendRecordTrajectoryAnalytics(token, num, trajectoryId,messageId,conversationId, modelName).catch(err => logger.warn('发送轨迹分析失败:', err.message));
-  sendLog(token,num,trajectoryId,conversationId,messageId).catch(err => logger.warn('发送log失败:', err.message));
+  sendRecordTrajectoryAnalytics(token, num, trajectoryId, messageId, conversationId, modelName).catch(err => logger.warn('发送轨迹分析失败:', err.message));
+  sendLog(token, num, trajectoryId, conversationId, messageId).catch(err => logger.warn('发送log失败:', err.message));
 
   const parts = data.response?.candidates?.[0]?.content?.parts || [];
   const images = parts.filter(p => p.inlineData).map(p => p.inlineData.data);
@@ -520,45 +522,39 @@ export async function generateImageForSD(requestBody, token) {
   return images;
 }
 
-export async function sendRecordTrajectoryAnalytics(token, num, trajectoryId,executionId,cascadeId, modelName = "claude-opus-4-6-thinking") {
-  const trajectorybody = generateTrajectorybody(num, trajectoryId,executionId,cascadeId, modelName, token);
+export async function sendRecordTrajectoryAnalytics(token, num, trajectoryId, executionId, cascadeId, modelName = "claude-opus-4-6-thinking") {
+  const trajectorybody = generateTrajectorybody(num, trajectoryId, executionId, cascadeId, modelName, token);
   const headers = buildHeaders(token);
   headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(trajectorybody)));
   try {
-    if (useAxios) {
-      await httpRequest({
-        method: 'POST',
-        url: config.api.recordTrajectory,
-        headers,
-        data: trajectorybody
-      });
-    } else {
-      const response = await requester.antigravity_fetch(config.api.recordTrajectory, buildRequesterConfig(headers, trajectorybody));
-      if (response.status !== 200) {
-        const errorBody = await response.text();
-        throw new Error(`轨迹分析请求失败 (${response.status}): ${errorBody}`);
-      }
-    }
+    await requesterManager.fetch(config.api.recordTrajectory, {
+      method: 'POST',
+      headers,
+      body: trajectorybody,
+      okStatus: [200],
+    });
   } catch (error) {
-    throw error;
+    throw new Error(`轨迹分析请求失败 (${error.status ?? ''}): ${error.message}`);
   }
 }
-export async function sendLog(token, num, trajectoryId, conversationId,messageId) {
+
+export async function sendLog(token, num, trajectoryId, conversationId, messageId) {
   const sessionId = trajectoryId;
   //const conversationId = randomUUID();
-  
+
   const logs = [
     createLog2(conversationId, token, sessionId),
-    createTelemetryBatch(num, sessionId,conversationId,messageId,token.sub),
+    createTelemetryBatch(num, sessionId, conversationId, messageId, token.sub),
     createLog1(conversationId, token, sessionId)
   ];
-  
+
   const headers = buildHeaders(token);
   headers["Host"] = "play.googleapis.com";
   headers["User-Agent"] = "Go-http-client/1.1";
   headers["Content-Type"] = "application/octet-stream";
   headers["Accept-Encoding"] = "gzip";
-  
+
+  // TLS 请求器暂不支持二进制 body，此处固定使用 axios
   try {
     for (const log of logs) {
       const serializeData = serializeTelemetryBatch(log);
@@ -567,7 +563,7 @@ export async function sendLog(token, num, trajectoryId, conversationId,messageId
       }
       const serializeLogBody = serializeData.data;
       headers["Content-Length"] = String(serializeLogBody.length);
-      
+
       await axios({
         method: 'POST',
         url: "https://play.googleapis.com/log",
@@ -583,48 +579,32 @@ export async function sendLog(token, num, trajectoryId, conversationId,messageId
 export async function sendRecordCodeAssistMetrics(token, trajectoryId) {
   const requestBody = buildRecordCodeAssistMetricsBody(token, trajectoryId);
   const headers = buildHeaders(token);
-  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody),'utf-8'));
+  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody), 'utf-8'));
   try {
-    if (useAxios) {
-      await httpRequest({
-        method: 'POST',
-        url: config.api.recordCodeAssistMetrics,
-        headers,
-        data: requestBody
-      });
-    } else {
-      const response = await requester.antigravity_fetch(config.api.recordCodeAssistMetrics, buildRequesterConfig(headers, requestBody));
-      if (response.status !== 200) {
-        const errorBody = await response.text();
-        throw new Error(`RecordCodeAssistMetrics请求失败 (${response.status}): ${errorBody}`);
-      }
-    }
+    await requesterManager.fetch(config.api.recordCodeAssistMetrics, {
+      method: 'POST',
+      headers,
+      body: requestBody,
+      okStatus: [200],
+    });
   } catch (error) {
-    throw error;
+    throw new Error(`RecordCodeAssistMetrics请求失败 (${error.status ?? ''}): ${error.message}`);
   }
 }
 
 export async function sendClientRegister(token) {
   const requestBody = buildClientRegister(token);
   const headers = buildClientRegisterHeaders(token);
-  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody),'utf-8'));
+  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody), 'utf-8'));
   try {
-    if (useAxios) {
-      await httpRequest({
-        method: 'POST',
-        url: config.api.unleash.register,
-        headers,
-        data: requestBody
-      });
-    } else {
-      const response = await requester.antigravity_fetch(config.api.unleash.register, buildRequesterConfig(headers, requestBody));
-      if (response.status !== 200 && response.status !== 202) {
-        const errorBody = await response.text();
-        throw new Error(`ClientRegister请求失败 (${response.status}): ${errorBody}`);
-      }
-    }
+    await requesterManager.fetch(config.api.unleash.register, {
+      method: 'POST',
+      headers,
+      body: requestBody,
+      okStatus: [200, 202],
+    });
   } catch (error) {
-    throw error;
+    throw new Error(`ClientRegister请求失败 (${error.status ?? ''}): ${error.message}`);
   }
 }
 
@@ -632,79 +612,51 @@ export async function sendClientFeature(token) {
   const headers = buildClientFeatrueHeaders(token);
   //console.log(headers);
   try {
-    if (useAxios) {
-      await httpRequest({
-        method: 'GET',
-        url: config.api.unleash.features,
-        headers
-      });
-    } else {
-      const response = await requester.antigravity_fetch(config.api.unleash.features, buildRequesterConfig(headers, null, "GET"));
-      if (response.status !== 200 && response.status !== 202) {
-        const errorBody = await response.text();
-        throw new Error(`ClientFeature请求失败 (${response.status}): ${errorBody}`);
-      }
-    }
+    await requesterManager.fetch(config.api.unleash.features, {
+      method: 'GET',
+      headers,
+      okStatus: [200, 202],
+    });
   } catch (error) {
-    throw error;
+    throw new Error(`ClientFeature请求失败 (${error.status ?? ''}): ${error.message}`);
   }
 }
 
 export async function sendFrontEnd(token) {
   const requestBody = buildFrontEnd(token);
   const headers = buildFrontEndHeaders(token);
-  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody),'utf-8'));
+  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody), 'utf-8'));
   try {
-    if (useAxios) {
-      await httpRequest({
-        method: 'POST',
-        url: config.api.unleash.frontend,
-        headers,
-        data: requestBody
-      });
-    } else {
-      const response = await requester.antigravity_fetch(config.api.unleash.frontend, buildRequesterConfig(headers, requestBody));
-      if (response.status !== 200 && response.status !== 202) {
-        const errorBody = await response.text();
-        throw new Error(`FrontEnd请求失败 (${response.status}): ${errorBody}`);
-      }
-    }
+    await requesterManager.fetch(config.api.unleash.frontend, {
+      method: 'POST',
+      headers,
+      body: requestBody,
+      okStatus: [200, 202],
+    });
   } catch (error) {
-    throw error;
+    throw new Error(`FrontEnd请求失败 (${error.status ?? ''}): ${error.message}`);
   }
 }
 
 export async function sendCheckPoint(token) {
   const requestBody = generateCheckpointBody(token);
   const headers = buildHeaders(token);
-  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody),'utf-8'));
-  if (checkPointList.has(token.sessionId)){
+  headers["Content-Length"] = String(Buffer.byteLength(JSON.stringify(requestBody), 'utf-8'));
+  if (checkPointList.has(token.sessionId)) {
     return;
-  }else{
+  } else {
     checkPointList.add(token.sessionId);
   }
   try {
-    if (useAxios) {
-      await httpRequest({
-        method: 'POST',
-        url: config.api.url,
-        headers,
-        data: requestBody
-      });
-    } else {
-      const response = await requester.antigravity_fetch(config.api.url, buildRequesterConfig(headers, requestBody));
-      if (response.status !== 200 && response.status !== 202) {
-        const errorBody = await response.text();
-        throw new Error(`CheckPoint请求失败 (${response.status}): ${errorBody}`);
-      }
-    }
+    await requesterManager.fetch(config.api.url, {
+      method: 'POST',
+      headers,
+      body: requestBody,
+      okStatus: [200, 202],
+    });
   } catch (error) {
-    throw error;
+    throw new Error(`CheckPoint请求失败 (${error.status ?? ''}): ${error.message}`);
   }
-}
-
-export function closeRequester() {
-  if (requester) requester.close();
 }
 
 // 导出内存清理注册函数（供外部调用）

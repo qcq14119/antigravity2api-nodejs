@@ -59,21 +59,24 @@ export const handleOpenAIRequest = async (req, res) => {
       quotaManager.updateQuota(tokenId, quotas);
     };
 
-    // 创建 with429Retry 选项
-    const createRetryOptions = (prefix) => ({
-      loggerPrefix: prefix,
-      onAttempt: () => tokenManager.recordRequest(token, model),
-      tokenId,
-      modelId: model,
-      refreshQuota
-    });
-
     const isImageModel = model.includes('-image');
     const requestBody = generateRequestBody(messages, model, params, tools, token);
 
     if (isImageModel) {
       prepareImageRequest(requestBody);
     }
+
+    // 创建 with429Retry 选项
+    const createRetryOptions = (prefix) => ({
+      loggerPrefix: prefix,
+      onAttempt: () => tokenManager.recordRequest(token, model),
+      tokenId,
+      modelId: model,
+      refreshQuota,
+      tokenManager,
+      token,
+      requestBody  // 传递 requestBody 用于积分注入
+    });
     //console.log(JSON.stringify(requestBody,null,2));
     const { id, created } = createResponseMeta();
     const safeRetries = getSafeRetries(config.retryTimes);
@@ -87,7 +90,12 @@ export const handleOpenAIRequest = async (req, res) => {
       try {
         if (isImageModel) {
           const { content, usage, reasoningSignature } = await with429Retry(
-            () => generateAssistantResponseNoStream(requestBody, token),
+            (attempt, shouldUseCredits) => {
+              const actualRequestBody = shouldUseCredits 
+                ? { ...requestBody, enabledCreditTypes: ["GOOGLE_ONE_AI"] }
+                : requestBody;
+              return generateAssistantResponseNoStream(actualRequestBody, token);
+            },
             safeRetries,
             createRetryOptions('chat.stream.image ')
           );
@@ -102,33 +110,38 @@ export const handleOpenAIRequest = async (req, res) => {
           let usageData = null;
 
           await with429Retry(
-            () => generateAssistantResponse(requestBody, token, (data) => {
-              if (data.type === 'usage') {
-                usageData = data.usage;
-              } else if (data.type === 'reasoning') {
-                const delta = { reasoning_content: data.reasoning_content };
-                if (data.thoughtSignature && config.passSignatureToClient) {
-                  delta.thoughtSignature = data.thoughtSignature;
-                }
-                writeStreamData(res, createStreamChunk(id, created, model, delta));
-              } else if (data.type === 'tool_calls') {
-                hasToolCall = true;
-                // 根据配置决定是否透传工具调用中的签名
-                const toolCallsWithIndex = data.tool_calls.map((toolCall, index) => {
-                  if (config.passSignatureToClient) {
-                    return { index, ...toolCall };
-                  } else {
-                    const { thoughtSignature, ...rest } = toolCall;
-                    return { index, ...rest };
+            (attempt, shouldUseCredits) => {
+              const actualRequestBody = shouldUseCredits 
+                ? { ...requestBody, enabledCreditTypes: ["GOOGLE_ONE_AI"] }
+                : requestBody;
+              return generateAssistantResponse(actualRequestBody, token, (data) => {
+                if (data.type === 'usage') {
+                  usageData = data.usage;
+                } else if (data.type === 'reasoning') {
+                  const delta = { reasoning_content: data.reasoning_content };
+                  if (data.thoughtSignature && config.passSignatureToClient) {
+                    delta.thoughtSignature = data.thoughtSignature;
                   }
-                });
-                const delta = { tool_calls: toolCallsWithIndex };
-                writeStreamData(res, createStreamChunk(id, created, model, delta));
-              } else {
-                const delta = { content: data.content };
-                writeStreamData(res, createStreamChunk(id, created, model, delta));
-              }
-            }),
+                  writeStreamData(res, createStreamChunk(id, created, model, delta));
+                } else if (data.type === 'tool_calls') {
+                  hasToolCall = true;
+                  // 根据配置决定是否透传工具调用中的签名
+                  const toolCallsWithIndex = data.tool_calls.map((toolCall, index) => {
+                    if (config.passSignatureToClient) {
+                      return { index, ...toolCall };
+                    } else {
+                      const { thoughtSignature, ...rest } = toolCall;
+                      return { index, ...rest };
+                    }
+                  });
+                  const delta = { tool_calls: toolCallsWithIndex };
+                  writeStreamData(res, createStreamChunk(id, created, model, delta));
+                } else {
+                  const delta = { content: data.content };
+                  writeStreamData(res, createStreamChunk(id, created, model, delta));
+                }
+              });
+            },
             safeRetries,
             createRetryOptions('chat.stream ')
           );
@@ -161,20 +174,25 @@ export const handleOpenAIRequest = async (req, res) => {
 
       try {
         await with429Retry(
-          () => generateAssistantResponse(requestBody, token, (data) => {
-            if (data.type === 'usage') {
-              usageData = data.usage;
-            } else if (data.type === 'reasoning') {
-              reasoningContent += data.reasoning_content || '';
-              if (data.thoughtSignature) {
-                reasoningSignature = data.thoughtSignature;
+          (attempt, shouldUseCredits) => {
+            const actualRequestBody = shouldUseCredits 
+              ? { ...requestBody, enabledCreditTypes: ["GOOGLE_ONE_AI"] }
+              : requestBody;
+            return generateAssistantResponse(actualRequestBody, token, (data) => {
+              if (data.type === 'usage') {
+                usageData = data.usage;
+              } else if (data.type === 'reasoning') {
+                reasoningContent += data.reasoning_content || '';
+                if (data.thoughtSignature) {
+                  reasoningSignature = data.thoughtSignature;
+                }
+              } else if (data.type === 'tool_calls') {
+                toolCalls.push(...data.tool_calls);
+              } else if (data.type === 'text') {
+                content += data.content || '';
               }
-            } else if (data.type === 'tool_calls') {
-              toolCalls.push(...data.tool_calls);
-            } else if (data.type === 'text') {
-              content += data.content || '';
-            }
-          }),
+            });
+          },
           safeRetries,
           createRetryOptions('chat.fake_no_stream ')
         );
@@ -217,7 +235,12 @@ export const handleOpenAIRequest = async (req, res) => {
       res.setTimeout(0); // 禁用响应超时
 
       const { content, reasoningContent, reasoningSignature, toolCalls, usage } = await with429Retry(
-        () => generateAssistantResponseNoStream(requestBody, token),
+        (attempt, shouldUseCredits) => {
+          const actualRequestBody = shouldUseCredits 
+            ? { ...requestBody, enabledCreditTypes: ["GOOGLE_ONE_AI"] }
+            : requestBody;
+          return generateAssistantResponseNoStream(actualRequestBody, token);
+        },
         safeRetries,
         createRetryOptions('chat.no_stream ')
       );
